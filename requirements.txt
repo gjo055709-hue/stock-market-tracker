@@ -1,0 +1,10 @@
+streamlit==1.52.2
+pandas==2.3.3
+plotly==6.5.2
+pytz==2025.2
+exchange-calendars==4.11.2
+requests==2.32.5
+numpy==2.3.5
+scikit-learn==1.7.2
+openai==2.8.1
+yfinance==0.2.66
