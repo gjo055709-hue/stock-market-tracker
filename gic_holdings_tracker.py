@@ -9,6 +9,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, time, timedelta
 from email.utils import parsedate_to_datetime
 from html import escape, unescape
+from io import StringIO
+from threading import Lock
+from time import monotonic, sleep
 from urllib.parse import quote, urlsplit
 from xml.etree import ElementTree
 
@@ -24,12 +27,31 @@ from curl_cffi import requests as curl_requests
 from openai import OpenAI
 from scipy.stats import linregress
 from sklearn.ensemble import IsolationForest
+from yfinance.exceptions import YFRateLimitError
 
 ET = pytz.timezone("America/New_York")
 UK = pytz.timezone("Europe/London")
 KST = pytz.timezone("Asia/Seoul")
 NYSE = calendars.get_calendar("XNYS")
 MACRO_SYMBOLS = ("^TNX", "^VIX", "DX-Y.NYB", "QQQ")
+# Instrument name and illustrative price/change for Live Sim.
+EXCHANGE_TICKERS = {
+    "SPY": ("S&P 500", 638.42, .64),
+    "QQQ": ("NASDAQ-100", 563.13, .93),
+    "DIA": ("DOW JONES", 434.85, .22),
+    "IWM": ("RUSSELL 2000", 224.76, -.31),
+    "SMH": ("VANECK SEMICONDUCTOR", 290.31, 1.28),
+    "SOXX": ("ISHARES SEMICONDUCTOR", 253.60, 1.13),
+    "XLK": ("TECHNOLOGY SELECT SECTOR", 256.18, .76),
+    "^VIX": ("VIX", 16.47, -2.08),
+    "^TNX": ("US 10-YEAR TREASURY YIELD", 4.29, -.47),
+    "IEF": ("US 10-YEAR TREASURY BOND", 94.72, -.28),
+    "^FTSE": ("FTSE 100", 8914.75, .37),
+    "^KS11": ("KOSPI", 3188.41, -.21),
+    "^KQ11": ("KOSDAQ", 805.42, .51),
+    "GLD": ("GOLD", 306.84, .52),
+}
+EXCHANGE_TICKER_TTL = 15
 WATCHLIST = {
     "NVDA": ("NVIDIA", 180, 20, 142.50), "MSFT": ("Microsoft", 485, 10, 390),
     "GOOGL": ("Alphabet", 205, 15, 169), "META": ("Meta Platforms", 640, 6, 535),
@@ -48,11 +70,334 @@ NEWS_FEED = "News feed"
 MODEL = "gpt-4o-mini"
 TIMEOUT = 5
 MARKET_REFRESH_SECONDS = 10
+YAHOO_REQUEST_INTERVAL = 0.4
 SIP_DELAY = timedelta(minutes=15, seconds=10)
 MAX_POSITIONS = 24
 POSITION_LIMIT = 100_000_000
-TICKER_PATTERN = re.compile(r"[A-Z][A-Z0-9.\-]{0,9}")
+TICKER_PATTERN = re.compile(r"[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*")
 FEED_LABELS = {"sip": "Alpaca SIP · 15m delay", "iex": "Alpaca IEX · real time"}
+
+
+TOP_20 = (
+    "NVDA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "AVGO", "TSLA", "TSM", "PLTR",
+    "AMD", "ARM", "MU", "SMCI", "ORCL", "CRM", "NFLX", "JPM", "BRK-B", "SMH",
+)
+STOCK_PAGE_SIZE = 20
+DIRECTORY_TTL_SECONDS = 86_400
+MARKET_FILTERS = ("TOP 20", "S&P 500", "NASDAQ", "NYSE")
+SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+SYMBOL_DIRECTORY = "https://www.nasdaqtrader.com/dynamic/SymDir"
+EXCLUDED_SECURITIES = re.compile(r"\b(?:warrants?|rights?|units|preferred\s+(?:stock|shares?))\b", re.I)
+FALLBACK_NON_SP500 = {
+    "ARM", "ASML", "BABA", "BHP", "BRK-A", "HSBC", "MELI", "MSTR", "NVO", "NVS",
+    "RBLX", "RIO", "RY", "SAP", "SHEL", "TM", "TSM", "TTE", "UBS",
+}
+ADD_POSITION = "Add ticker…"
+
+# Leading U.S.-listed equities for browsing when a directory is unavailable.
+FALLBACK_NASDAQ = """
+NVDA|NVIDIA Corporation
+AAPL|Apple Inc.
+MSFT|Microsoft Corporation
+GOOGL|Alphabet Inc. Class A
+GOOG|Alphabet Inc. Class C
+AMZN|Amazon.com, Inc.
+META|Meta Platforms, Inc.
+AVGO|Broadcom Inc.
+TSLA|Tesla, Inc.
+PLTR|Palantir Technologies Inc.
+AMD|Advanced Micro Devices, Inc.
+ARM|Arm Holdings plc
+MU|Micron Technology, Inc.
+SMCI|Super Micro Computer, Inc.
+NFLX|Netflix, Inc.
+WMT|Walmart Inc.
+ASML|ASML Holding N.V.
+COST|Costco Wholesale Corporation
+CSCO|Cisco Systems, Inc.
+TMUS|T-Mobile US, Inc.
+PEP|PepsiCo, Inc.
+QCOM|QUALCOMM Incorporated
+AMAT|Applied Materials, Inc.
+INTU|Intuit Inc.
+ISRG|Intuitive Surgical, Inc.
+AMGN|Amgen Inc.
+BKNG|Booking Holdings Inc.
+LIN|Linde plc
+LRCX|Lam Research Corporation
+TXN|Texas Instruments Incorporated
+GILD|Gilead Sciences, Inc.
+SBUX|Starbucks Corporation
+PANW|Palo Alto Networks, Inc.
+ADBE|Adobe Inc.
+ADP|Automatic Data Processing, Inc.
+HON|Honeywell International Inc.
+KLAC|KLA Corporation
+SNPS|Synopsys, Inc.
+CRWD|CrowdStrike Holdings, Inc.
+ADI|Analog Devices, Inc.
+INTC|Intel Corporation
+MDLZ|Mondelez International, Inc.
+MAR|Marriott International, Inc.
+MSTR|Strategy Inc.
+CEG|Constellation Energy Corporation
+MELI|MercadoLibre, Inc.
+PYPL|PayPal Holdings, Inc.
+FTNT|Fortinet, Inc.
+MNST|Monster Beverage Corporation
+ORLY|O'Reilly Automotive, Inc.
+CSX|CSX Corporation
+PCAR|PACCAR Inc
+FANG|Diamondback Energy, Inc.
+MRVL|Marvell Technology, Inc.
+CMCSA|Comcast Corporation
+WDAY|Workday, Inc.
+DASH|DoorDash, Inc.
+ABNB|Airbnb, Inc.
+ROST|Ross Stores, Inc.
+PAYX|Paychex, Inc.
+ADSK|Autodesk, Inc.
+AXON|Axon Enterprise, Inc.
+ROP|Roper Technologies, Inc.
+WBD|Warner Bros. Discovery, Inc.
+REGN|Regeneron Pharmaceuticals, Inc.
+LULU|lululemon athletica inc.
+EXC|Exelon Corporation
+EA|Electronic Arts Inc.
+CDNS|Cadence Design Systems, Inc.
+VRSK|Verisk Analytics, Inc.
+TTWO|Take-Two Interactive Software, Inc.
+CHTR|Charter Communications, Inc.
+NXPI|NXP Semiconductors N.V.
+VRTX|Vertex Pharmaceuticals Incorporated
+IDXX|IDEXX Laboratories, Inc.
+BKR|Baker Hughes Company
+CME|CME Group Inc.
+APP|AppLovin Corporation
+CTAS|Cintas Corporation
+IBKR|Interactive Brokers Group, Inc.
+EQIX|Equinix, Inc.
+CPRT|Copart, Inc.
+"""
+FALLBACK_NYSE = """
+TSM|Taiwan Semiconductor Manufacturing Company Limited
+ORCL|Oracle Corporation
+CRM|Salesforce, Inc.
+JPM|JPMorgan Chase & Co.
+BRK-B|Berkshire Hathaway Inc. Class B
+BRK-A|Berkshire Hathaway Inc. Class A
+LLY|Eli Lilly and Company
+V|Visa Inc.
+XOM|Exxon Mobil Corporation
+MA|Mastercard Incorporated
+UNH|UnitedHealth Group Incorporated
+JNJ|Johnson & Johnson
+PG|The Procter & Gamble Company
+HD|The Home Depot, Inc.
+CVX|Chevron Corporation
+ABBV|AbbVie Inc.
+BAC|Bank of America Corporation
+KO|The Coca-Cola Company
+MRK|Merck & Co., Inc.
+WFC|Wells Fargo & Company
+PM|Philip Morris International Inc.
+GS|The Goldman Sachs Group, Inc.
+MCD|McDonald's Corporation
+DHR|Danaher Corporation
+SPGI|S&P Global Inc.
+AXP|American Express Company
+CAT|Caterpillar Inc.
+IBM|International Business Machines Corporation
+MS|Morgan Stanley
+RTX|RTX Corporation
+GE|GE Aerospace
+NEE|NextEra Energy, Inc.
+TMO|Thermo Fisher Scientific Inc.
+UNP|Union Pacific Corporation
+PGR|The Progressive Corporation
+DIS|The Walt Disney Company
+C|Citigroup Inc.
+SCHW|The Charles Schwab Corporation
+ABT|Abbott Laboratories
+APH|Amphenol Corporation
+ETN|Eaton Corporation plc
+ICE|Intercontinental Exchange, Inc.
+BLK|BlackRock, Inc.
+LOW|Lowe's Companies, Inc.
+UBER|Uber Technologies, Inc.
+VZ|Verizon Communications Inc.
+T|AT&T Inc.
+BMY|Bristol-Myers Squibb Company
+NKE|NIKE, Inc.
+COP|ConocoPhillips
+BA|The Boeing Company
+AMT|American Tower Corporation
+SYK|Stryker Corporation
+CB|Chubb Limited
+MDT|Medtronic plc
+MCO|Moody's Corporation
+SHW|The Sherwin-Williams Company
+CVS|CVS Health Corporation
+UPS|United Parcel Service, Inc.
+DE|Deere & Company
+TGT|Target Corporation
+LMT|Lockheed Martin Corporation
+EL|The Estée Lauder Companies Inc.
+ECL|Ecolab Inc.
+SO|The Southern Company
+DUK|Duke Energy Corporation
+DELL|Dell Technologies Inc.
+NOW|ServiceNow, Inc.
+BX|Blackstone Inc.
+KKR|KKR & Co. Inc.
+AJG|Arthur J. Gallagher & Co.
+MMC|Marsh & McLennan Companies, Inc.
+BSX|Boston Scientific Corporation
+HCA|HCA Healthcare, Inc.
+PH|Parker-Hannifin Corporation
+ITW|Illinois Tool Works Inc.
+GD|General Dynamics Corporation
+NOC|Northrop Grumman Corporation
+MMM|3M Company
+SLB|SLB Limited
+WM|Waste Management, Inc.
+RSG|Republic Services, Inc.
+PLD|Prologis, Inc.
+WELL|Welltower Inc.
+O|Realty Income Corporation
+SPG|Simon Property Group, Inc.
+APO|Apollo Global Management, Inc.
+COF|Capital One Financial Corporation
+PNC|The PNC Financial Services Group, Inc.
+USB|U.S. Bancorp
+BK|The Bank of New York Mellon Corporation
+MET|MetLife, Inc.
+AIG|American International Group, Inc.
+AFL|Aflac Incorporated
+HIG|The Hartford Insurance Group, Inc.
+CMG|Chipotle Mexican Grill, Inc.
+YUM|Yum! Brands, Inc.
+CL|Colgate-Palmolive Company
+KMB|Kimberly-Clark Corporation
+HWM|Howmet Aerospace Inc.
+GEV|GE Vernova Inc.
+VST|Vistra Corp.
+EMR|Emerson Electric Co.
+TT|Trane Technologies plc
+NVO|Novo Nordisk A/S
+BABA|Alibaba Group Holding Limited
+SAP|SAP SE
+TM|Toyota Motor Corporation
+SHEL|Shell plc
+HSBC|HSBC Holdings plc
+NVS|Novartis AG
+TTE|TotalEnergies SE
+BHP|BHP Group Limited
+RIO|Rio Tinto plc
+RY|Royal Bank of Canada
+UBS|UBS Group AG
+RBLX|Roblox Corporation
+TFC|Truist Financial Corporation
+"""
+
+FALLBACK_STOCKS = {
+    exchange: dict(row.split("|", 1) for row in listing.strip().splitlines())
+    for exchange, listing in (("NASDAQ", FALLBACK_NASDAQ), ("NYSE", FALLBACK_NYSE))
+}
+FALLBACK_NAMES = FALLBACK_STOCKS["NASDAQ"] | FALLBACK_STOCKS["NYSE"]
+FALLBACK_STOCKS["S&P 500"] = {
+    ticker: name for ticker, name in FALLBACK_NAMES.items() if ticker not in FALLBACK_NON_SP500
+}
+FLAGSHIP_STOCKS = {
+    ticker: WATCHLIST[ticker][0] if ticker in WATCHLIST else FALLBACK_NAMES[ticker] for ticker in TOP_20
+}
+
+
+def normalize_stock_ticker(symbol):
+    return symbol.strip().upper().replace(".", "-")
+
+
+def directory_text(url):
+    response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+    response.raise_for_status()
+    return response.text
+
+
+def stock_rows(symbols, names):
+    listings = {}
+    for symbol, name in zip(symbols, names):
+        if not isinstance(symbol, str) or not isinstance(name, str):
+            continue
+        ticker = normalize_stock_ticker(symbol)
+        description = name.rpartition(" - ")[-1]
+        if TICKER_PATTERN.fullmatch(ticker) and name.strip() and not EXCLUDED_SECURITIES.search(description):
+            listings[ticker] = name.strip()
+    return listings
+
+
+def load_sp500_listings():
+    tables = pd.read_html(StringIO(directory_text(SP500_URL)), attrs={"id": "constituents"})
+    frame = tables[0]
+    return stock_rows(frame["Symbol"], frame["Security"])
+
+
+def load_nasdaqtrader_listings(filename, symbol_column, exchange=None):
+    frame = pd.read_csv(StringIO(directory_text(f"{SYMBOL_DIRECTORY}/{filename}")), sep="|",
+                        dtype=str, keep_default_na=False)
+    frame = frame.loc[~frame[symbol_column].str.strip().str.startswith("File Creation Time:")]
+    frame = frame.loc[frame["Test Issue"].str.strip().eq("N")]
+    if exchange:
+        frame = frame.loc[frame["Exchange"].str.strip().eq(exchange)]
+    return stock_rows(frame[symbol_column], frame["Security Name"])
+
+
+@st.cache_data(ttl=DIRECTORY_TTL_SECONDS, show_spinner=False)
+def load_exchange_universe():
+    """Cache independent directory listings and the sources using fallback data."""
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="gic-directory") as pool:
+        jobs = {
+            "S&P 500": pool.submit(load_sp500_listings),
+            "NASDAQ": pool.submit(load_nasdaqtrader_listings, "nasdaqlisted.txt", "Symbol"),
+            "NYSE": pool.submit(load_nasdaqtrader_listings, "otherlisted.txt", "ACT Symbol", "N"),
+        }
+        universe = {}
+        fallback = []
+        for exchange, job in jobs.items():
+            try:
+                stocks = job.result()
+            except Exception:
+                stocks = {}
+            if not stocks:
+                stocks = FALLBACK_STOCKS[exchange]
+                fallback.append(exchange)
+            universe[exchange] = stocks
+    return universe, tuple(fallback), monotonic()
+
+
+@st.cache_resource(show_spinner=False)
+def directory_executor():
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="gic-directory-loader")
+
+
+def exchange_catalog():
+    state = st.session_state
+    cached = state.get("gic_exchange_catalog")
+    future = state.get("gic_exchange_future")
+    if future is not None and future.done():
+        state.pop("gic_exchange_future")
+        # An already completed job does not block the Streamlit render.
+        try:
+            cached = future.result()
+        except Exception:
+            cached = (FALLBACK_STOCKS, tuple(FALLBACK_STOCKS), monotonic())
+        state.gic_exchange_catalog = cached
+        future = None
+
+    if cached and monotonic() - cached[2] < DIRECTORY_TTL_SECONDS:
+        return cached, False
+    if future is None:
+        state.gic_exchange_future = directory_executor().submit(load_exchange_universe)
+    return cached, True
 
 
 def setting(name):
@@ -201,25 +546,65 @@ def extract_download(data, symbols, intraday):
     return frames
 
 
+class FeedCooldown:
+    def __init__(self):
+        self.until = 0.0
+
+    def active(self):
+        return monotonic() < self.until
+
+    def pause(self, retry_after):
+        seconds = number(retry_after)
+        if seconds is None and retry_after:
+            try:
+                until = parsedate_to_datetime(retry_after)
+                if until.tzinfo is not None:
+                    seconds = (until - datetime.now(UTC)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                pass
+        self.until = monotonic() + (60 if seconds is None else max(seconds, 1))
+
+
 class YahooSession(curl_requests.Session):
-    """Keep yfinance's internal lookup and fundamentals requests bounded."""
+    """Pace the individual HTTPS requests inside a serialized yfinance batch."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.cooldown = FeedCooldown()
+        self.request_lock = Lock()
+        self.next_request = 0.0
 
     def request(self, method, url, *args, **kwargs):
         kwargs["timeout"] = TIMEOUT
-        return super().request(method, url, *args, **kwargs)
+        with self.request_lock:
+            if self.cooldown.active():
+                raise YFRateLimitError()
+            wait = self.next_request - monotonic()
+            if wait > 0:
+                sleep(wait)
+            self.next_request = monotonic() + YAHOO_REQUEST_INTERVAL
+            response = super().request(method, url, *args, **kwargs)
+            if response.status_code == 429:
+                self.cooldown.pause(response.headers.get("Retry-After"))
+                raise YFRateLimitError()
+            return response
 
 
 @st.cache_resource(show_spinner=False)
 def yahoo_session():
+    """Share request pacing and rate-limit state across the tracker."""
     return YahooSession(impersonate="chrome")
 
 
 def download_yahoo(symbols, period, interval, intraday):
     try:
+        session = yahoo_session()
+        if not symbols or session.cooldown.active():
+            return {}
         data = yf.download(
             list(symbols), period=period, interval=interval, prepost=intraday,
             group_by="ticker", threads=False, timeout=TIMEOUT, progress=False,
-            auto_adjust=False, ignore_tz=not intraday, session=yahoo_session(),
+            auto_adjust=False, ignore_tz=not intraday, session=session,
         )
         return extract_download(data, symbols, intraday)
     except Exception:
@@ -236,11 +621,78 @@ def yahoo_history(symbols):
     return download_yahoo(symbols, "3mo", "1d", False)
 
 
+@st.cache_data(ttl=EXCHANGE_TICKER_TTL, show_spinner=False)
+def load_exchange_ticker():
+    """Read each instrument's latest regular-session mark and prior close."""
+    session = yahoo_session()
+    quotes = {}
+    for symbol in EXCHANGE_TICKERS:
+        if session.cooldown.active():
+            break
+        try:
+            # Individual histories avoid the shared state in yf.download.
+            history = yf.Ticker(symbol, session=session).history(
+                period="5d", interval="1d", auto_adjust=False, timeout=TIMEOUT, raise_errors=True,
+            )
+            closes = normalize_frame(history, intraday=False)["c"]
+            if closes.empty:
+                continue
+            price = number(closes.iloc[-1])
+            previous = closes.iloc[-2] if len(closes) > 1 else None
+            quotes[symbol] = (price, change_pct(price, previous), closes.index[-1].date().isoformat())
+        except (YFRateLimitError, curl_requests.exceptions.ConnectionError):
+            break
+        except Exception:
+            continue
+    return quotes
+
+
+class ExchangeTickerFeed:
+    """Refresh the same ticker strip for all viewers without blocking the UI."""
+
+    def __init__(self):
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gic-exchange-ticker")
+        self._lock = Lock()
+        self._pending = None
+        self._refresh_at = 0.0
+        self._quotes = {}
+        self._fresh = frozenset()
+
+    def snapshot(self):
+        with self._lock:
+            if self._pending is not None and self._pending.done():
+                try:
+                    updated = self._pending.result()
+                except Exception:
+                    updated = {}
+                self._quotes.update(updated)
+                self._fresh = frozenset(updated)
+                self._pending = None
+                self._refresh_at = monotonic() + EXCHANGE_TICKER_TTL
+            if self._pending is None and monotonic() >= self._refresh_at:
+                self._pending = self._executor.submit(load_exchange_ticker)
+            return self._quotes.copy(), self._fresh
+
+
+@st.cache_resource(show_spinner=False)
+def exchange_ticker_feed():
+    return ExchangeTickerFeed()
+
+
+@st.cache_resource(show_spinner=False)
+def alpaca_cooldown():
+    return FeedCooldown()
+
+
 def alpaca_frames(symbols, start, end, feed, auth, timeframe):
+    cooldown = alpaca_cooldown()
+    if not symbols or cooldown.active():
+        return {}
     endpoint = "https://data.alpaca.markets/v2/stocks/bars"
     headers = {"APCA-API-KEY-ID": auth[0], "APCA-API-SECRET-KEY": auth[1]}
+    api_symbols = {ticker.replace("-", "."): ticker for ticker in symbols}
     params = {
-        "symbols": ",".join(symbols), "timeframe": timeframe, "feed": feed,
+        "symbols": ",".join(api_symbols), "timeframe": timeframe, "feed": feed,
         "adjustment": "split", "limit": 10_000,
         "start": start.astimezone(pytz.UTC).isoformat(), "end": end.astimezone(pytz.UTC).isoformat(),
     }
@@ -251,10 +703,15 @@ def alpaca_frames(symbols, start, end, feed, auth, timeframe):
             for _ in range(12):
                 response = client.get(endpoint, params=params, headers=headers,
                                       timeout=TIMEOUT, allow_redirects=False)
+                if response.status_code == 429:
+                    cooldown.pause(response.headers.get("Retry-After"))
+                    break
                 response.raise_for_status()
                 payload = response.json()
                 for symbol, bars in (payload["bars"] or {}).items():
-                    records.setdefault(symbol, []).extend(bars)
+                    ticker = api_symbols.get(symbol) or normalize_stock_ticker(symbol)
+                    if ticker in symbols:
+                        records.setdefault(ticker, []).extend(bars)
                 token = payload.get("next_page_token")
                 if not token:
                     break
@@ -298,17 +755,19 @@ def load_market_feeds(symbols, auth, feed, now):
         bucket_end = cutoff.replace(second=cutoff.second // 10 * 10, microsecond=0)
         equities = tuple(symbol for symbol in symbols if symbol not in MACRO_SYMBOLS)
         alpaca = alpaca_market(equities, previous[1], min(bounds[-1], bucket_end), feed, auth)
-    missing = tuple(symbol for symbol in symbols if symbol not in alpaca)
-    fetch = tuple(dict.fromkeys(missing + MACRO_SYMBOLS))
-    yahoo = yahoo_market(fetch)
-    history = yahoo_history(fetch) if yahoo else {}
+    missing = tuple(symbol for symbol in symbols if symbol not in alpaca and symbol not in MACRO_SYMBOLS)
+    yahoo = yahoo_market(missing) if missing else {}
+    # Reuse the same macro cache for every page without adding benchmarks to the stock batch.
+    macro = yahoo_market(MACRO_SYMBOLS)
+    history = yahoo_history(missing) if yahoo else {}
+    macro_history = yahoo_history(MACRO_SYMBOLS) if macro else {}
     alpaca_daily = alpaca_history(tuple(alpaca), previous[-1], feed, auth) if alpaca else {}
     coverage = dict.fromkeys(yahoo, now)
     if alpaca:
         coverage.update(dict.fromkeys(alpaca, min(bounds[-1], bucket_end)))
     return {
-        "bars": {**yahoo, **alpaca}, "history": {**history, **alpaca_daily},
-        "sources": {**dict.fromkeys(yahoo, SESSION_FEED), **dict.fromkeys(alpaca, FEED_LABELS[feed])},
+        "bars": {**macro, **yahoo, **alpaca}, "history": {**macro_history, **history, **alpaca_daily},
+        "sources": {**dict.fromkeys(macro | yahoo, SESSION_FEED), **dict.fromkeys(alpaca, FEED_LABELS[feed])},
         "coverage": coverage,
     }
 
@@ -529,9 +988,34 @@ def build_snapshot(now, symbols, live_sim, feeds=None):
             coverage = now
         quotes[ticker] = quote_summary(frame, history, source, bounds, prior, now, coverage)
     return {
-        "day": day, "session": session, "bounds": bounds, "quotes": quotes, "history": feeds["history"],
+        "day": day, "session": session, "bounds": bounds, "quotes": quotes,
+        "history": {ticker: frame for ticker, frame in feeds["history"].items()
+                    if ticker in quotes or ticker in MACRO_SYMBOLS},
         "anomalies": detect_anomalies(quotes), "as_of": now, "live_sim": live_sim,
         "macro": macro_snapshot(feeds, day, now, live_sim or session != "Closed"),
+    }
+
+
+def retain_off_page_positions(market, previous, positions):
+    retained = {ticker for ticker in positions if ticker in previous["quotes"] and ticker not in market["quotes"]}
+    for ticker in retained:
+        market["quotes"][ticker] = previous["quotes"][ticker]
+        if ticker in previous["history"]:
+            market["history"][ticker] = previous["history"][ticker]
+    market["anomalies"].extend(row for row in previous["anomalies"] if row["ticker"] in retained)
+    return retained
+
+
+def retain_page_feeds(previous, incoming, symbols):
+    requested = set(symbols) | set(MACRO_SYMBOLS)
+    missing = requested - incoming["bars"].keys()
+    # Carry a symbol's previous bars and their metadata together on a partial failure.
+    return {
+        field: {
+            **{ticker: data for ticker, data in previous.get(field, {}).items() if ticker in missing},
+            **{ticker: data for ticker, data in values.items() if ticker in requested},
+        }
+        for field, values in incoming.items()
     }
 
 
@@ -541,39 +1025,48 @@ def market_snapshot(symbols, live_sim, auth, feed):
     day, session, _ = market_clock(now)
     identity = (symbols, live_sim, feed, day)
     state = st.session_state
+    saved = state.get("provider_data")
+    feeds = saved[1] if saved and saved[0][1:] == identity[1:] and not live_sim else None
     pending = state.get("market_pending")
     updated = False
-    if pending and pending[1].done():
+    if pending and pending[0] != identity and pending[1].cancel():
+        state.pop("market_pending")
+    elif pending and pending[1].done():
         pending_id, future = state.pop("market_pending")
         try:
             result = future.result()
         except Exception:
             result = None
-        if pending_id == identity and result and result["bars"]:
-            state["provider_data"] = (identity, result)
+        if pending_id[1:] == identity[1:] and result and result["bars"]:
+            feeds = retain_page_feeds(feeds or {}, result, symbols)
+            state["provider_data"] = (identity, feeds)
             updated = True
 
     requested = state.get("market_requested")
     timestamp = now.timestamp()
-    due = (not requested or requested[0] != identity or timestamp - requested[1] >= MARKET_REFRESH_SECONDS)
+    # Changing pages never increases the request cadence.
+    due = not requested or timestamp - requested[1] >= MARKET_REFRESH_SECONDS
     if not live_sim and not state.get("market_pending") and due:
         future = feed_executor().submit(load_market_feeds, symbols, auth, feed, now)
         state["market_pending"] = (identity, future)
         state["market_requested"] = (identity, timestamp)
 
-    saved = state.get("provider_data")
-    feeds = saved[1] if saved and saved[0] == identity and not live_sim else None
-    fetching = not live_sim and not feeds and bool(state.get("market_pending"))
+    fetching = not live_sim and bool(state.get("market_pending")) and (
+        not feeds or any(ticker not in feeds["bars"] for ticker in symbols)
+    )
     current = state.get("market_snapshot")
     refresh = (
         not current or current["identity"] != identity or updated or current["session"] != session
         or (current["ticks"] and current["as_of"] != now)
     )
     if refresh:
+        previous = current
         current = build_snapshot(now, symbols, live_sim, feeds)
         simulated = current["macro"]["source"] == SIMULATED or any(
             entry["source"] == SIMULATED for entry in current["quotes"].values()
         )
+        if previous and previous["identity"][1:] == identity[1:]:
+            current["off_page_positions"] = retain_off_page_positions(current, previous, state.get("positions", {}))
         current.update({"identity": identity, "ticks": simulated and (live_sim or session != "Closed")})
         state["market_snapshot"] = current
     current["fetching"] = fetching
@@ -1479,7 +1972,8 @@ TERMINAL_CSS = """
   --muted: #99a8c2; --subtle: #788aa8; --bright: #edf4ff;
   --cyan: #00e5ff; --green: #00ff88; --red: #ff2a5f;
   --font: "JetBrains Mono", "Fira Code", ui-monospace, Consolas, monospace;
-  --gic-grid: calc(100dvh - 97px);
+  --gic-dashboard-height: calc(100vh - 88px);
+  --gic-grid: calc(var(--gic-dashboard-height) - 49px);
   --gic-chart: calc(var(--gic-grid) * .45 - 6px);
   --gic-copilot: calc(var(--gic-grid) * .55 - 6px);
   --gic-chat: calc(var(--gic-copilot) - 151px);
@@ -1655,19 +2149,126 @@ footer, #MainMenu, [data-testid="stDecoration"], [data-testid="stToolbarActions"
 </style>
 """
 
+STOCK_BROWSER_CSS = """
+<style>
+.st-key-gic_stock_controls [data-baseweb="input"] {
+  background: #101929; border-color: #263c53; border-radius: 6px;
+}
+.st-key-gic_stock_controls [data-baseweb="base-input"] { background: #101929; }
+.st-key-gic_stock_controls input {
+  color: var(--bright); font: 11px var(--font); background: transparent;
+}
+.st-key-gic_stock_controls input::placeholder { color: var(--muted); }
+.st-key-gic_stock_controls button {
+  color: #bff8ff; background: #101e2a; border: 1px solid #254457;
+  min-height: 30px; padding: 2px 7px;
+}
+.st-key-gic_stock_controls button p { font: 700 10px var(--font); white-space: nowrap; }
+.st-key-gic_stock_controls button:is([aria-pressed="true"], [aria-checked="true"]) {
+  color: var(--cyan); background: #102c3a; border-color: #25788d;
+}
+.st-key-gic_stock_controls button:disabled { color: var(--subtle); }
+.gic-directory-meta, .gic-page {
+  color: var(--muted); font: 10px var(--font); white-space: nowrap;
+}
+.gic-directory-meta { overflow: hidden; text-overflow: ellipsis; }
+.gic-page { text-align: center; }
+.st-key-gic_holdings .gic-table-wrap { max-height: max(75px, calc(var(--gic-grid) - 296px)); }
+.st-key-gic_holdings .gic-table td {
+  height: clamp(29px, calc((var(--gic-grid) - 330px) / 20), 47px);
+}
+.st-key-gic_holdings .gic-name {
+  max-width: 170px; overflow: hidden; text-overflow: ellipsis; vertical-align: middle;
+}
+@media (min-width: 1431px) {
+  .st-key-gic_holdings .gic-name { display: inline-block; }
+}
+</style>
+"""
+
+EXCHANGE_TICKER_CSS = """
+.gic-exchange-strip {
+  position: fixed; bottom: 0; left: 0; width: 100%; z-index: 9999;
+  box-sizing: border-box; height: 40px; background: #030407; border-top: 1px solid #151D2E;
+  display: flex; align-items: center; overflow: hidden; white-space: nowrap;
+  font: 700 14px/1 var(--font); font-variant-numeric: tabular-nums; letter-spacing: 0.4px;
+}
+.gic-exchange-track {
+  display: flex; flex: none; width: max-content;
+  animation: tickerScroll 55s linear infinite;
+}
+.gic-exchange-strip:is(:hover, :focus-within) .gic-exchange-track { animation-play-state: paused; }
+.gic-exchange-lane { display: flex; flex: none; min-width: 100vw; justify-content: space-between; }
+.gic-exchange-quote { display: inline-flex; align-items: center; gap: 7px; padding-left: 10px; }
+.gic-exchange-symbol { color: #FFD60A; text-shadow: 0 0 8px rgba(255, 214, 10, 0.45); }
+.gic-exchange-price { color: #E6F1FF; min-width: 9ch; text-align: right; }
+.gic-exchange-move { color: var(--muted); min-width: 10ch; text-align: right; }
+.gic-exchange-move.gain { color: #00FF88; text-shadow: 0 0 7px rgba(0, 255, 136, .42); }
+.gic-exchange-move.loss { color: #FF2A5F; text-shadow: 0 0 7px rgba(255, 42, 95, .42); }
+.gic-exchange-status { color: var(--subtle); width: 4ch; }
+.gic-exchange-divider { color: #3A465A; }
+@keyframes tickerScroll { to { transform: translate3d(-50%, 0, 0); } }
+@media (prefers-reduced-motion: reduce) {
+  .gic-exchange-strip { overflow-x: auto; scrollbar-width: none; }
+  .gic-exchange-track { animation: none; }
+  .gic-exchange-lane[aria-hidden="true"] { display: none; }
+}
+"""
+
+EXCHANGE_TICKER_HTML = """
+<div class="gic-exchange-strip" role="region" aria-label="Exchange ticker" tabindex="0">
+  <div class="gic-exchange-track">
+    <div class="gic-exchange-lane" role="list"></div>
+    <div class="gic-exchange-lane" role="list" aria-hidden="true"></div>
+  </div>
+</div>
+"""
+
+EXCHANGE_TICKER_JS = """
+export default function({data, parentElement}) {
+    const lanes = parentElement.querySelectorAll('.gic-exchange-lane');
+    for (const lane of lanes) {
+        data.forEach(({name, price, move, direction, status, title}, index) => {
+            let item = lane.children[index];
+            if (!item) {
+                item = document.createElement('span');
+                item.className = 'gic-exchange-quote';
+                item.setAttribute('role', 'listitem');
+                item.innerHTML = `<span class="gic-exchange-symbol"></span><span class="gic-exchange-price"></span>
+                    <span class="gic-exchange-move"></span><span class="gic-exchange-status"></span>
+                    <span class="gic-exchange-divider" aria-hidden="true">│</span>`;
+                lane.append(item);
+            }
+            // Update the cells in place so quote refreshes never restart the marquee.
+            const [label, mark, delta, flag] = item.children;
+            label.textContent = name;
+            mark.textContent = price;
+            delta.textContent = move;
+            delta.className = `gic-exchange-move ${direction}`;
+            flag.textContent = status;
+            item.title = title;
+        });
+    }
+}
+"""
+
+
 HOLDING_COMPONENT_JS = """
 export default function(component) {
     const { data, setTriggerValue, parentElement } = component;
     if (parentElement.gicMarkup === data && parentElement.querySelector('.gic-table-wrap')) return;
     parentElement.gicMarkup = data;
-    const oldScroll = parentElement.querySelector('.gic-table-wrap')?.scrollTop ?? 0;
+    const oldTable = parentElement.querySelector('.gic-table-wrap');
     const oldFocus = parentElement.querySelector(':focus')?.dataset?.symbol;
     parentElement.innerHTML = data;
     const table = parentElement.querySelector('.gic-table-wrap');
     if (!table) return;
-    table.scrollTop = oldScroll;
-    if (oldFocus) {
-        table.querySelector(`button[data-symbol="${CSS.escape(oldFocus)}"]`)?.focus({preventScroll: true});
+    if (oldTable && oldTable.dataset.page === table.dataset.page) {
+        table.scrollTop = oldTable.scrollTop;
+        table.scrollLeft = oldTable.scrollLeft;
+        if (oldFocus) {
+            table.querySelector(`button[data-symbol="${CSS.escape(oldFocus)}"]`)?.focus({preventScroll: true});
+        }
     }
     table.onclick = (event) => {
         const row = event.target.closest('tr[data-ticker]');
@@ -1741,15 +2342,118 @@ def value_class(value):
     return "gain" if value > 0 else "loss"
 
 
+def exchange_ticker_data(live_sim):
+    quotes, fresh = ({}, frozenset()) if live_sim else exchange_ticker_feed().snapshot()
+    rows = []
+    for symbol, (name, demo_price, demo_move) in EXCHANGE_TICKERS.items():
+        price, move, day = quotes.get(symbol, (None, None, None))
+        status = ""
+        if live_sim:
+            price, move = demo_price, demo_move
+            status, detail = "SIM", "Illustrative quote"
+        elif day:
+            status = "" if symbol in fresh else "LAST"
+            detail = f"{'Last available' if status else 'Latest'} session · {day}"
+        else:
+            detail = "Quote unavailable"
+        price_label = metric(price, ",.2f")
+        if symbol == "^TNX" and price is not None:
+            price_label += "%"
+        direction = value_class(move)
+        move_label = {"gain": "▲ ", "loss": "▼ ", "muted": ""}[direction] + percent(move)
+        if direction == "muted" and move is not None:
+            move_label = "0.00%"
+        rows.append({
+            "name": name, "price": price_label, "move": move_label, "direction": direction,
+            "status": status, "title": f"{name} · {detail}",
+        })
+    return rows
+
+
 def session_feed_label(source):
     return "SIMULATION" if source == SIMULATED else "SESSION FEED"
 
 
-def holding_rows(market, positions, selected, portfolio):
+def stock_matches(search, exchange):
+    search = search.strip()
+    if not search and exchange == "TOP 20":
+        return list(FLAGSHIP_STOCKS.items()), (), False
+    catalog, loading = exchange_catalog()
+    if catalog is None:
+        return [], (), loading
+    universe, fallback, _ = catalog
+    if not search:
+        return sorted(universe[exchange].items()), tuple(name for name in fallback if name == exchange), loading
+
+    listings = FLAGSHIP_STOCKS | universe["NYSE"] | universe["NASDAQ"] | universe["S&P 500"]
+    query = search.casefold()
+    ticker_query = normalize_stock_ticker(search)
+    ranked = [[], [], [], []]
+    for ticker, name in sorted(listings.items()):
+        if ticker == ticker_query:
+            ranked[0].append((ticker, name))
+        elif ticker.startswith(ticker_query):
+            ranked[1].append((ticker, name))
+        elif ticker_query in ticker:
+            ranked[2].append((ticker, name))
+        elif query in name.casefold():
+            ranked[3].append((ticker, name))
+    return [row for group in ranked for row in group], fallback, loading
+
+
+def change_stock_page(step):
+    st.session_state.gic_stock_page += step
+
+
+def stock_browser_controls():
+    state = st.session_state
+    with st.container(key="gic_stock_controls"):
+        search_column, filters = st.columns([1, 1.15], vertical_alignment="center")
+        with search_column:
+            search = st.text_input(
+                "Search Stock (Ticker or Company Name)", key="gic_stock_search",
+                label_visibility="collapsed", placeholder="Search Stock (Ticker or Company Name)",
+            )
+        with filters:
+            exchange = st.pills(
+                "Exchange", MARKET_FILTERS, default="TOP 20", key="gic_stock_filter",
+                label_visibility="collapsed",
+            ) or "TOP 20"
+
+        signature = (search, exchange)
+        if state.get("gic_stock_filter_signature") != signature:
+            state.gic_stock_filter_signature = signature
+            state.gic_stock_page = 1
+        matches, fallback, loading = stock_matches(search, exchange)
+        pages = max(1, (len(matches) + STOCK_PAGE_SIZE - 1) // STOCK_PAGE_SIZE)
+        page = min(pages, max(1, state.get("gic_stock_page", 1)))
+        state.gic_stock_page = page
+
+        detail, previous, cursor, following = st.columns([3.2, .7, 1.05, .7], vertical_alignment="center")
+        with detail:
+            message = f"{len(matches):,} {'matching symbols' if search.strip() else 'symbols'}"
+            if loading:
+                message = "Refreshing exchange directory…" if matches else "Loading exchange directory…"
+            if fallback:
+                message += " · Fallback for " + ", ".join(fallback)
+            st.html(f'<div class="gic-directory-meta" title="{escape(message, quote=True)}">{escape(message)}</div>')
+        with previous:
+            st.button("Prev", key="gic_stock_prev", disabled=page == 1,
+                      on_click=change_stock_page, args=(-1,), width="stretch")
+        with cursor:
+            st.html(f'<div class="gic-page">Page {page} of {pages}</div>')
+        with following:
+            st.button("Next", key="gic_stock_next", disabled=page == pages,
+                      on_click=change_stock_page, args=(1,), width="stretch")
+    start = (page - 1) * STOCK_PAGE_SIZE
+    return dict(matches[start:start + STOCK_PAGE_SIZE]), loading
+
+
+def holding_rows(market, stocks, selected, portfolio, loading_directory=False):
     scores = {entry["ticker"]: entry for entry in market["anomalies"]}
     pnl = {entry["ticker"]: entry["position_pnl"] for entry in portfolio["positions"]}
     rows = []
-    for ticker in positions:
+    for ticker, company in stocks.items():
         entry, alert = market["quotes"][ticker], scores[ticker]
         session = entry["latest_extended"]
         change = entry["sessions"].get(session, {}).get("delta_pct")
@@ -1762,12 +2466,13 @@ def holding_rows(market, positions, selected, portfolio):
         source = escape(f"{session_feed_label(entry['source'])} · {display_et(entry['time'])}", quote=True)
         tooltip = escape(f"{alert['extended_session'] or 'Extended'} peak {percent(move)}", quote=True)
         symbol = escape(ticker, quote=True)
-        name = escape(WATCHLIST.get(ticker, ("",))[0])
+        name = escape(company)
+        company_title = escape(company, quote=True)
         gain = pnl.get(ticker)
         close_title = f'Regular close · {entry["regular_close_date"]} ET' if entry["regular_close"] is not None else ""
         rows.append(
             f'<tr class="{" ".join(flags)}" data-ticker="{symbol}">'
-            f'<td><button type="button" class="gic-symbol" data-symbol="{symbol}" '
+            f'<td><button type="button" class="gic-symbol" data-symbol="{symbol}" title="{company_title}" '
             f'aria-pressed="{str(ticker == selected).lower()}">{symbol}</button>'
             f'<span class="gic-name">{name}</span></td>'
             f'<td title="{source}">{price_text(entry["price"])}</td>'
@@ -1781,9 +2486,12 @@ def holding_rows(market, positions, selected, portfolio):
         )
     columns = ("Ticker", "Session price", "Reg close", "Ext-hours Δ", "Volume ratio", "Anomaly / 100", "Position P&L")
     headings = "".join(f'<th scope="col">{label}</th>' for label in columns)
+    empty_message = "Loading listings…" if loading_directory else "No stocks match this search."
+    content = "".join(rows) or f'<tr><td colspan="7" class="muted">{empty_message}</td></tr>'
+    page_key = escape(",".join(stocks), quote=True)
     return (
-        '<div class="gic-table-wrap"><table class="gic-table" aria-label="AI holdings">'
-        f'<thead><tr>{headings}</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
+        f'<div class="gic-table-wrap" data-page="{page_key}"><table class="gic-table" aria-label="Stocks">'
+        f'<thead><tr>{headings}</tr></thead><tbody>{content}</tbody></table></div>'
     )
 
 
@@ -1859,9 +2567,11 @@ def portfolio_strip(portfolio):
     ) + "</div>"
 
 
-def market_view(market, positions, selected, holding_picker):
-    sources = {market["quotes"][ticker]["source"] for ticker in positions}
-    if market["live_sim"]:
+def market_view(market, stocks, positions, selected, holding_picker, loading_directory=False):
+    sources = {market["quotes"][ticker]["source"] for ticker in stocks}
+    if not stocks:
+        feed_label = "LOADING DIRECTORY" if loading_directory else "NO RESULTS"
+    elif market["live_sim"]:
         feed_label = "LIVE SIM"
     elif market["fetching"]:
         feed_label = "SIM · CONNECTING"
@@ -1873,28 +2583,32 @@ def market_view(market, positions, selected, holding_picker):
         feed_label = "LIVE FEED"
     style = " gic-sim" if SIMULATED in sources else ""
     st.html(
-        '<div class="gic-panel-top"><div><h2>AI holdings</h2>'
-        f'<div class="gic-panel-meta">{len(positions)} SYMBOLS · {market["day"]:%b %d, %Y} ET</div></div>'
+        '<div class="gic-panel-top"><div><h2>Stock tracker</h2>'
+        f'<div class="gic-panel-meta">{len(stocks)} SYMBOLS · {market["day"]:%b %d, %Y} ET</div></div>'
         f'<span class="gic-tag{style}">{escape(feed_label.upper())}</span></div>'
     )
     portfolio = evaluate_portfolio(positions, market)
     st.html(portfolio_strip(portfolio))
     result = holding_picker(
-        data=holding_rows(market, positions, selected, portfolio), key="gic_holding_picker",
+        data=holding_rows(market, stocks, selected, portfolio, loading_directory), key="gic_holding_picker",
         on_ticker_change=lambda: None, isolate_styles=False,
     )
-    if result.ticker in positions and result.ticker != selected:
-        st.session_state.selected_ticker = result.ticker
+    state = st.session_state
+    if result.ticker in stocks and (result.ticker != selected or state.get("gic_relative")):
+        state.gic_chart_pick = result.ticker
         st.rerun(scope="app")
-    anomalies = [entry for entry in market["anomalies"] if entry["ticker"] in positions]
+    anomalies = [entry for entry in market["anomalies"] if entry["ticker"] in stocks]
     breakout = sum(entry["extended_breakout"] for entry in anomalies)
     surge = sum(entry["volume_surge"] for entry in anomalies)
+    portfolio_caption = (
+        "Off-page positions use last seen marks."
+        if market.get("off_page_positions") else "Position P&L is measured against entry cost."
+    )
     st.html(
         f'<div class="gic-rule-strip"><span><b>{breakout}</b> extended moves beyond ±3%</span>'
         f'<span><b>{surge}</b> above 1.8× volume</span>'
         f'<span><b>{portfolio["priced_positions"]}</b> marked positions</span></div>'
-        '<div class="gic-panel-meta">Volume vs prior 20 regular sessions · Position P&L vs entry cost · '
-        'Hover a price for feed details.</div>'
+        f'<div class="gic-panel-meta">Volume vs prior 20 regular sessions · {portfolio_caption}</div>'
     )
 
 
@@ -1961,23 +2675,26 @@ def brief(history):
 def edit_position(selected, field_key, remove=False):
     state = st.session_state
     positions = state.positions.copy()
-    symbol = selected or state["gic_new_symbol"].strip().upper()
+    symbol = selected or normalize_stock_ticker(state.get("gic_new_symbol", ""))
     if remove:
         if len(positions) < 2:
-            state.position_notice = ("error", "Keep at least one ticker in the watchlist.")
+            state.position_notice = ("error", "Keep at least one ticker in the portfolio.")
             return
         del positions[symbol]
         state.position_editor = next(iter(positions))
         message = f"Removed {symbol}."
     else:
-        if not TICKER_PATTERN.fullmatch(symbol) or (selected is None and symbol in positions):
-            state.position_notice = ("error", "Enter a valid ticker that is not already in the watchlist.")
+        if selected is None and (not TICKER_PATTERN.fullmatch(symbol) or symbol in positions):
+            state.position_notice = ("error", "Enter a valid ticker that is not already in the portfolio.")
             return
         if selected is None and len(positions) >= MAX_POSITIONS:
-            state.position_notice = ("error", f"The watchlist supports up to {MAX_POSITIONS} tickers.")
+            state.position_notice = ("error", f"The portfolio supports up to {MAX_POSITIONS} positions.")
             return
         positions[symbol] = {"shares": state[f"{field_key}_shares"], "cost_basis": state[f"{field_key}_cost"]}
         state.position_editor = symbol
+        if selected is None:
+            state.selected_ticker = symbol
+            state.gic_relative = False
         message = f"Saved {symbol}."
     state.positions = positions
     state.position_notice = ("success", message)
@@ -1986,14 +2703,16 @@ def edit_position(selected, field_key, remove=False):
 def sidebar_settings(positions, auth, configured_key):
     st.header("Portfolio settings")
     st.caption("Illustrative positions. Edit shares and average entry cost for each ticker.")
-    add_option = "Add ticker…"
-    selection = st.selectbox("Position", [add_option, *positions], index=1, key="position_editor")
-    selected = None if selection == add_option else selection
+    options = [ADD_POSITION, *positions]
+    if st.session_state.get("position_editor") not in options:
+        st.session_state.position_editor = next(iter(positions), ADD_POSITION)
+    selection = st.selectbox("Position", options, key="position_editor")
+    selected = None if selection == ADD_POSITION else selection
     current = positions.get(selected, {"shares": 0., "cost_basis": 0.})
     field_key = f"gic_position_{selected or 'new'}"
     with st.form(field_key, clear_on_submit=selected is None):
         if selected is None:
-            st.text_input("Ticker", max_chars=10, key="gic_new_symbol")
+            st.text_input("Ticker", max_chars=22, key="gic_new_symbol")
         st.number_input("Shares", min_value=0., max_value=float(POSITION_LIMIT), key=f"{field_key}_shares",
                         value=float(current["shares"]), step=1.)
         st.number_input("Average cost (USD)", min_value=0., max_value=float(POSITION_LIMIT), key=f"{field_key}_cost",
@@ -2105,23 +2824,30 @@ def main():
     st.set_page_config(page_title="GIC Holdings Tracker", page_icon="◈",
                        layout="wide", initial_sidebar_state="collapsed")
     st.html(TERMINAL_CSS)
+    st.html(STOCK_BROWSER_CSS)
     state = st.session_state
     state.setdefault("chat_history", [])
     state.setdefault("finance_memory", empty_finance_memory())
     state.setdefault("copilot_queue", [])
     state.setdefault("positions", default_positions())
     state.setdefault("selected_ticker", "NVDA")
+    picked = state.pop("gic_chart_pick", None)
+    if picked:
+        state.selected_ticker = picked
+        state.gic_relative = False
+        state.position_editor = picked if picked in state.positions else ADD_POSITION
+        state.gic_new_symbol = "" if picked in state.positions else picked
 
     key_id, secret_key = setting("APCA_API_KEY_ID"), setting("APCA_API_SECRET_KEY")
     auth = (key_id, secret_key) if key_id and secret_key else None
     with st.sidebar:
         positions, feed, active_model_key = sidebar_settings(state.positions, auth, setting("OPENAI_API_KEY"))
-    if state.selected_ticker not in positions:
-        state.selected_ticker = next(iter(positions))
-    symbols = tuple(dict.fromkeys((*positions, "SMH")))
 
     holding_picker = st.components.v2.component("gic_holdings_picker", js=HOLDING_COMPONENT_JS)
     chat_scroll = st.components.v2.component("gic_chat_scroll", js=CHAT_SCROLL_JS)
+    exchange_ticker = st.components.v2.component(
+        "gic_exchange_ticker", html=EXCHANGE_TICKER_HTML, css=EXCHANGE_TICKER_CSS, js=EXCHANGE_TICKER_JS,
+    )
     with st.container(key="gic_command"):
         brand, pulse, sim = st.columns([2.6, 6.55, .92], vertical_alignment="center")
         with brand:
@@ -2135,21 +2861,34 @@ def main():
 
         @st.fragment(run_every="1s")
         def render_pulse():
-            market = market_snapshot(symbols, live_sim, auth, feed)
+            market = visible_snapshot()
             st.html(header_pulse(datetime.now(ET), market))
 
-        with pulse:
-            render_pulse()
+    holdings, right = st.columns([56, 44])
+    with holdings, st.container(key="gic_holdings"):
+        stocks, loading_directory = stock_browser_controls()
+        stock_list = st.container()
+
+    def visible_snapshot():
+        chart_symbol = "SMH" if state.get("gic_relative") else state.selected_ticker
+        symbols = tuple(sorted({*stocks, chart_symbol}))
+        return market_snapshot(symbols, live_sim, auth, feed)
+
+    with pulse:
+        render_pulse()
 
     @st.fragment(run_every="1s")
     def render_holdings():
-        market = market_snapshot(symbols, live_sim, auth, feed)
-        market_view(market, positions, state.selected_ticker, holding_picker)
+        future = state.get("gic_exchange_future")
+        if loading_directory and future is not None and future.done():
+            st.rerun(scope="app")
+        market = visible_snapshot()
+        market_view(market, stocks, positions, state.selected_ticker, holding_picker, loading_directory)
 
     @st.fragment(run_every="1s")
     def render_chart():
-        market = market_snapshot(symbols, live_sim, auth, feed)
-        chart_view(market, state.selected_ticker, positions)
+        market = visible_snapshot()
+        chart_view(market, state.selected_ticker, stocks)
 
     @st.fragment(run_every="1s")
     def render_copilot_header():
@@ -2210,8 +2949,11 @@ def main():
         if submitted:
             ask_copilot(typed)
 
-    holdings, right = st.columns([56, 44])
-    with holdings, st.container(key="gic_holdings"):
+    @st.fragment(run_every="2s")
+    def render_exchange_ticker():
+        exchange_ticker(data=exchange_ticker_data(live_sim), key="gic_exchange_ticker", isolate_styles=False)
+
+    with stock_list:
         render_holdings()
     with right:
         with st.container(key="gic_chart"):
@@ -2221,6 +2963,7 @@ def main():
             render_quick_actions()
             render_chat_feed()
             render_prompt()
+    render_exchange_ticker()
 
 
 if __name__ == "__main__":

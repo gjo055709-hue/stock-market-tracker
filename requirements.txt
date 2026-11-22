@@ -4,6 +4,8 @@ plotly==6.5.2
 pytz==2025.2
 exchange-calendars==4.11.2
 requests==2.32.5
+lxml>=5,<7
+html5lib>=1.1,<2
 curl_cffi>=0.7,<1
 numpy==2.3.5
 scipy>=1.13,<2
