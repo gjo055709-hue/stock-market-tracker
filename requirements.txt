@@ -4,7 +4,9 @@ plotly==6.5.2
 pytz==2025.2
 exchange-calendars==4.11.2
 requests==2.32.5
+curl_cffi>=0.7,<1
 numpy==2.3.5
+scipy>=1.13,<2
 scikit-learn==1.7.2
-openai==2.8.1
+openai>=1.50.0,<3
 yfinance==0.2.66
