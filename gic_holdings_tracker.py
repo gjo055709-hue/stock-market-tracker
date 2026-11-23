@@ -12,6 +12,7 @@ from email.utils import parsedate_to_datetime
 from functools import lru_cache
 from html import escape, unescape
 from io import StringIO
+from pathlib import Path
 from threading import Lock
 from time import monotonic, sleep
 from time import time as wall_time
@@ -1717,6 +1718,7 @@ html, body, [data-testid="stAppViewContainer"] {
 .stMainBlockContainer [data-testid="stLayoutWrapper"]:has(> .st-key-gic_intro) {
   position: fixed; inset: 0; z-index: 999999; pointer-events: none;
 }
+.st-key-gic_intro_media { display: none; }
 .stMainBlockContainer [data-testid="stVerticalBlock"],
 .stMainBlockContainer [data-testid="stHorizontalBlock"] { gap: 14px; }
 [data-testid="stHeader"] { background: transparent; height: 46px; }
@@ -1921,6 +1923,7 @@ footer, #MainMenu, [data-testid="stDecoration"], [data-testid="stToolbarActions"
 
 
 INTRO_DURATION = 4.3
+INTRO_ASSETS = Path(__file__).resolve().parent / "assets"
 INTRO_HTML = """
 <div class="gic-splash" aria-hidden="true">
   <div class="gic-splash-emblem">GIC</div>
@@ -1928,6 +1931,7 @@ INTRO_HTML = """
   <div class="gic-splash-subtitle">by Geonuk Investing Company</div>
   <div class="gic-splash-track"><div class="gic-splash-fill"></div></div>
   <div class="gic-splash-count"></div>
+  <video class="gic-splash-video" muted playsinline preload="auto" tabindex="-1"></video>
 </div>
 """
 
@@ -1974,6 +1978,11 @@ INTRO_CSS = """
   animation: gicSplashCount 3.2s linear both;
 }
 .gic-splash-count::after { content: "Opening session " counter(pct) "%"; }
+.gic-splash-video {
+  position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0;
+  object-fit: contain; background: #030407; pointer-events: none;
+}
+.gic-splash-video.is-ready { opacity: 1; }
 @keyframes gicSplashProgress {
   from { width: 0%; }
   to { width: 100%; }
@@ -1999,8 +2008,12 @@ export default function({data, parentElement}) {
     const fade = animations.find(animation => animation.animationName === 'gicSplashFade');
     // Resume from the elapsed session time if Streamlit creates a new overlay.
     const elapsed = Math.max(fade?.currentTime ?? 0, data.elapsed * 1000);
+    const video = splash.querySelector('.gic-splash-video');
+    let mediaObserver;
     const dismiss = () => {
         clearTimeout(deadline);
+        mediaObserver?.disconnect();
+        video.pause();
         splash.remove();
     };
     // Keep the dashboard reachable if the CSS animation is unavailable or canceled.
@@ -2010,6 +2023,27 @@ export default function({data, parentElement}) {
         animation.currentTime = Math.max(animation.currentTime ?? 0, elapsed);
     }
     fade?.finished.then(dismiss, () => {});
+    if (data.has_video) {
+        const intro = parentElement.closest('.st-key-gic_intro');
+        video.muted = true;
+        video.onplaying = () => video.classList.add('is-ready');
+        video.onerror = () => video.classList.remove('is-ready');
+        video.onloadedmetadata = () => {
+            if (data.elapsed < video.duration) video.currentTime = data.elapsed;
+        };
+        const loadVideo = () => {
+            const source = intro?.querySelector('.st-key-gic_intro_media video')?.getAttribute('src');
+            if (!source) return false;
+            mediaObserver?.disconnect();
+            video.src = source;
+            video.play().catch(() => video.classList.remove('is-ready'));
+            return true;
+        };
+        if (!loadVideo() && intro) {
+            mediaObserver = new MutationObserver(loadVideo);
+            mediaObserver.observe(intro, {childList: true, subtree: true, attributes: true, attributeFilter: ['src']});
+        }
+    }
     return dismiss;
 }
 """
@@ -2817,6 +2851,20 @@ def ask_copilot(text):
         st.session_state.copilot_queue.append(prompt)
 
 
+def serve_intro_video():
+    """Publish the local opening clip via Streamlit's media handler."""
+    for extension in ("mp4", "webm"):
+        try:
+            clip = (INTRO_ASSETS / f"gic-opening.{extension}").read_bytes()
+        except OSError:
+            continue
+        if clip:
+            with st.container(key="gic_intro_media"):
+                st.video(clip, format=f"video/{extension}", muted=True)
+            return True
+    return False
+
+
 def main():
     st.set_page_config(page_title="GIC Holdings Tracker", page_icon="◈",
                        layout="wide", initial_sidebar_state="collapsed")
@@ -2827,8 +2875,9 @@ def main():
     with st.container(key="gic_intro"):
         intro_elapsed = max(0.0, wall_time() - intro_start)
         if intro_elapsed < INTRO_DURATION:
+            has_video = serve_intro_video()
             intro = st.components.v2.component("gic_intro", html=INTRO_HTML, css=INTRO_CSS, js=INTRO_JS)
-            intro(data={"elapsed": intro_elapsed, "duration": INTRO_DURATION},
+            intro(data={"elapsed": intro_elapsed, "duration": INTRO_DURATION, "has_video": has_video},
                   key="gic_intro_animation", isolate_styles=False)
     state.setdefault("finance_memory", empty_finance_memory())
     if "finnhub_chat_history" not in state:

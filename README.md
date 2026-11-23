@@ -24,6 +24,10 @@ python3.12 -m venv .venv
 
 Open [localhost:8501](http://localhost:8501) if your browser does not open automatically. Use normal browser zoom on a 1080p display. Press **Ctrl+C** in the terminal to stop the server.
 
+## Opening animation
+
+Place an exported clip at `assets/gic-opening.mp4` or `assets/gic-opening.webm` to play it during startup. Streamlit serves the file locally and plays it muted. The built-in opening plays when the clip is missing or cannot load, and the splash dismisses automatically.
+
 ## Connect market data and the Co-Pilot
 
 1. Create a free Finnhub account and copy your API key from the dashboard. [Finnhub dashboard](https://finnhub.io/dashboard)
