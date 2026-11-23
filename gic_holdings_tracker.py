@@ -5,7 +5,7 @@ import hmac
 import json
 import os
 import re
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import UTC, datetime, time, timedelta
 from email.utils import parsedate_to_datetime
@@ -31,12 +31,13 @@ UK = pytz.timezone("Europe/London")
 KST = pytz.timezone("Asia/Seoul")
 NYSE = calendars.get_calendar("XNYS")
 EXCHANGE_TICKERS = {
-    "SPY": "S&P 500", "QQQ": "NASDAQ-100", "DIA": "DOW JONES", "IWM": "RUSSELL 2000",
+    "^GSPC": "S&P 500", "^NDX": "NASDAQ-100", "^DJI": "DOW JONES", "^RUT": "RUSSELL 2000",
+    "^VIX": "VIX", "^TNX": "US 10-YEAR TREASURY YIELD", "^FTSE": "FTSE 100",
+    "^KS11": "KOSPI", "^KQ11": "KOSDAQ",
     "SMH": "VANECK SEMICONDUCTOR", "SOXX": "ISHARES SEMICONDUCTOR",
-    "XLK": "TECHNOLOGY SELECT SECTOR", "VIXY": "VIX", "IEF": "US 10-YEAR TREASURY",
-    "EWU": "FTSE 100", "EWY": "KOSPI", "GLD": "GOLD",
+    "XLK": "TECHNOLOGY SELECT SECTOR", "IEF": "US 10-YEAR TREASURY BOND", "GLD": "GOLD",
 }
-MACRO_SYMBOLS = {"SPY": "S&P 500", "QQQ": "NASDAQ-100", "IEF": "10Y TREASURY", "VIXY": "VIX"}
+MACRO_SYMBOLS = {"^GSPC": "S&P 500", "^NDX": "NASDAQ-100", "^TNX": "10Y YIELD", "^VIX": "VIX"}
 # Company name, editable example shares and average cost (USD).
 WATCHLIST = {
     "NVDA": ("NVIDIA", 20, 142.50), "MSFT": ("Microsoft", 10, 390),
@@ -60,7 +61,19 @@ FINNHUB_ENDPOINTS = {
 }
 CHART_QUOTE_TTL = 12
 TABLE_QUOTE_TTL = 30
-STRIP_QUOTE_TTL = 60
+CHART_HISTORY_TTL = 30
+HOURLY_HISTORY_TTL = 60
+BENCHMARK_TTL = 60
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart"
+YAHOO_CHART_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+PARQET_LOGO_URL = "https://logos.parqet.com/ticker"
 # Reserve headroom below the provider's 60/minute and 30/second ceilings.
 MINUTE_BUDGET = 58
 SECOND_BUDGET = 28
@@ -652,7 +665,7 @@ class FinnhubFeed:
                 return self.pause_label
             active_quotes = (self.cache.get(("quote", symbol)) for symbol in symbols)
             if any(quote and now - quote["received_at"] <= 90 for quote in active_quotes):
-                return "FINNHUB LIVE"
+                return "ready"
             return self.last_problem
 
 
@@ -665,6 +678,149 @@ def quote_workers():
 def finnhub_feed(credential_id, _api_key):
     """Share the quote cache, dated session observations and rolling budget for one credential."""
     return FinnhubFeed(_api_key, quote_workers())
+
+
+def yahoo_timestamp(value):
+    stamp = number(value)
+    return datetime.fromtimestamp(stamp, UTC) if stamp and 0 < stamp < 4_102_444_800 else None
+
+
+def yahoo_chart(symbol, span, interval, extended=False):
+    response = requests.get(
+        f"{YAHOO_CHART_URL}/{quote(symbol, safe='')}",
+        params={"range": span, "interval": interval, "includePrePost": str(extended).lower()},
+        headers=YAHOO_CHART_HEADERS, timeout=TIMEOUT, allow_redirects=False,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    chart = payload.get("chart") if isinstance(payload, dict) else None
+    if not isinstance(chart, dict):
+        raise ValueError("Unexpected chart response")
+    results = chart.get("result") or []
+    if not results:
+        return (), {}
+
+    data = results[0]
+    quote_series = (data.get("indicators") or {}).get("quote") or [{}]
+    closes = quote_series[0].get("close") or []
+    candles = {}
+    for stamp, close in zip(data.get("timestamp") or [], closes):
+        at, price = yahoo_timestamp(stamp), positive_price(close)
+        if at is not None and price is not None:
+            candles[at] = price
+    return tuple(sorted(candles.items())), data.get("meta") or {}
+
+
+@st.cache_data(ttl=CHART_HISTORY_TTL, max_entries=128, show_spinner=False)
+def intraday_history(symbol):
+    candles, _ = yahoo_chart(symbol, "1d", "5m", extended=True)
+    today = datetime.now(ET).date()
+    today_candles = tuple((at, price) for at, price in candles if at.astimezone(ET).date() == today)
+    if len(today_candles) >= 3:
+        return today_candles, 5
+    recent, _ = yahoo_chart(symbol, "5d", "15m", extended=True)
+    if recent:
+        return recent, 15
+    return (today_candles, 5) if today_candles else None
+
+
+@st.cache_data(ttl=HOURLY_HISTORY_TTL, max_entries=512, show_spinner=False)
+def hourly_history(symbol):
+    candles, _ = yahoo_chart(symbol, "5d", "1h")
+    return tuple(price for _, price in candles)
+
+
+@st.cache_data(ttl=BENCHMARK_TTL, max_entries=32, show_spinner=False)
+def benchmark_history(symbol):
+    candles, meta = yahoo_chart(symbol, "5d", "1d")
+    try:
+        exchange_zone = pytz.timezone(meta.get("exchangeTimezoneName") or "UTC")
+    except pytz.UnknownTimeZoneError:
+        exchange_zone = UTC
+    sessions = {at.astimezone(exchange_zone).date(): (at, close) for at, close in candles}
+    latest_at = yahoo_timestamp(meta.get("regularMarketTime"))
+    latest = positive_price(meta.get("regularMarketPrice"))
+    if latest_at is not None and latest is not None:
+        latest_day = latest_at.astimezone(exchange_zone).date()
+        last_candle = sessions.get(latest_day)
+        if latest_day >= max(sessions, default=latest_day) and (last_candle is None or latest_at >= last_candle[0]):
+            sessions[latest_day] = (latest_at, latest)
+    if not sessions:
+        return None
+    last_days = sorted(sessions)[-2:]
+    at, current = sessions[last_days[-1]]
+    prior = sessions[last_days[0]][1] if len(last_days) == 2 else None
+    if symbol == "^TNX":
+        # The feed can express the 10-year yield in tenths of a percent.
+        current = current / 10 if current > 20 else current
+        prior = prior / 10 if prior is not None and prior > 20 else prior
+        move = number((current - prior) * 100) if prior is not None else None
+        unit = "yield"
+    else:
+        move = change_pct(current, prior)
+        unit = "points" if symbol.startswith("^") else "usd"
+    return {"value": current, "move": move, "unit": unit,
+            "as_of_et": at.astimezone(ET).isoformat(), "session_date": last_days[-1].isoformat()}
+
+
+class HistoryFeed:
+    """Read cached chart data without waiting for external requests in a UI fragment."""
+
+    def __init__(self):
+        self.workers = ThreadPoolExecutor(max_workers=8, thread_name_prefix="gic-chart-history")
+        self.lock = Lock()
+        self.cache = OrderedDict()
+        self.pending = set()
+        self.paused_until = 0.0
+
+    def read(self, loader, symbols, ttl):
+        values = {}
+        with self.lock:
+            now = monotonic()
+            for symbol in symbols:
+                key = (loader.__name__, symbol)
+                value, refresh_at = self.cache.get(key, (None, 0.0))
+                values[symbol] = value
+                if key in self.cache:
+                    self.cache.move_to_end(key)
+                if now >= max(refresh_at, self.paused_until) and key not in self.pending and len(self.pending) < 40:
+                    self.pending.add(key)
+                    self.workers.submit(self._refresh, loader, key, ttl)
+        return values
+
+    def checked(self, loader, symbol):
+        with self.lock:
+            return (loader.__name__, symbol) in self.cache
+
+    def _refresh(self, loader, key, ttl):
+        value, retry = None, ttl
+        try:
+            with self.lock:
+                paused = monotonic() < self.paused_until
+            if not paused:
+                value = loader(key[1])
+        except requests.HTTPError as exc:
+            response = exc.response
+            if response is not None and response.status_code == 429:
+                with self.lock:
+                    self.paused_until = max(self.paused_until, monotonic() + retry_delay(response.headers.get("Retry-After")))
+            retry = max(ttl, 60)
+        except (requests.RequestException, ValueError, TypeError, KeyError, IndexError, AttributeError, OverflowError):
+            retry = max(ttl, 60)
+        finally:
+            with self.lock:
+                last_value, _ = self.cache.get(key, (None, 0.0))
+                self.cache[key] = (value or last_value, monotonic() + retry)
+                self.cache.move_to_end(key)
+                if len(self.cache) > 640:
+                    self.cache.popitem(last=False)
+                self.pending.discard(key)
+
+
+@st.cache_resource(show_spinner=False)
+def history_feed():
+    """Share cached history and completed fetch attempts across browser fragments."""
+    return HistoryFeed()
 
 
 def quote_summary(raw, previous=None):
@@ -710,8 +866,9 @@ def market_snapshot(feed, stocks, selected, positions):
     if feed:
         feed.request([selected], CHART_QUOTE_TTL)
         feed.request(stocks, TABLE_QUOTE_TTL)
+        feed.request(["SMH"], BENCHMARK_TTL)
     held = [ticker for ticker, position in positions.items() if position["shares"]]
-    symbols = dict.fromkeys([selected, *stocks, *held, *EXCHANGE_TICKERS])
+    symbols = dict.fromkeys([selected, *stocks, *held, "SMH"])
     marks = feed.read(symbols) if feed else {}
     empty = quote_summary(None)
     quotes = {}
@@ -724,6 +881,7 @@ def market_snapshot(feed, stocks, selected, positions):
         quotes[symbol] = mark or empty
     snapshot = {
         "as_of": now, "day": day, "session": session, "quotes": quotes,
+        "benchmarks": st.session_state.get("gic_benchmark_marks", {}),
         "off_page_positions": any(ticker not in stocks and quotes[ticker]["price"] is not None for ticker in held),
     }
     st.session_state.market_snapshot = snapshot
@@ -732,20 +890,15 @@ def market_snapshot(feed, stocks, selected, positions):
 
 def record_chart_quote(history, ticker, quote):
     tape = history.get(ticker)
-    if not quote:
+    if not quote or quote["time"] is None:
         return tape
     observed = quote["time"]
-    day = observed.date() if observed else None
-    if tape is None or (day and (tape["day"] is None or day > tape["day"])):
-        # High and low have no trade times in /quote. Keep them separate from the timed line.
-        tape = {"day": day, "references": (), "ticks": deque(maxlen=6000)}
+    day = observed.date()
+    if tape is None or tape["day"] is None or day > tape["day"]:
+        tape = {"day": day, "ticks": deque(maxlen=6000)}
         history[ticker] = tape
     ticks = tape["ticks"]
-    if day != tape["day"] or (observed and ticks and observed < ticks[-1][0]):
-        return tape
-    tape["references"] = (quote["prior_close"], quote["low"], quote["high"])
-    if observed is None:
-        tape["references"] += (quote["price"],)
+    if day != tape["day"] or (ticks and observed < ticks[-1][0]):
         return tape
     tick = (observed, quote["price"])
     if ticks and observed == ticks[-1][0]:
@@ -922,7 +1075,7 @@ TOOL_LABELS = {
 TOOL_SCHEMAS = [
     tool_schema("tool_get_all_holdings", "Read session prices, regular closes, extended moves, volume ratios, anomaly scores and position P&L for the current AI watchlist."),
     tool_schema("tool_lookup_any_ticker", "Research any stock or ETF by ticker, including the latest Finnhub quote, intraday range and available fundamentals.", ticker="string"),
-    tool_schema("tool_get_macro_regime", "Read benchmark fund prices and daily returns for SPY, QQQ, IEF and VIXY, with implications for AI equities."),
+    tool_schema("tool_get_macro_regime", "Read the S&P 500, Nasdaq-100 and VIX index levels and daily changes, plus the US 10-year yield and its basis-point move."),
     tool_schema("tool_search_live_news", "Find timestamped recent headlines and feed summaries for a stock ticker or a macro topic.", topic_or_ticker="string"),
     tool_schema("tool_portfolio_risk_and_pnl", "Calculate marked value, position weights, unrealized and day P&L, and leading contributors and detractors."),
     tool_schema("tool_quant_scenario_calc", "Calculate portfolio dollar impact from a signed percent move in one holding or the Nasdaq-100 (NASDAQ or QQQ).", ticker="string", pct_move="number"),
@@ -1176,24 +1329,21 @@ class GICMarketAgent:
         }
 
     def tool_get_macro_regime(self):
-        indicators = {}
-        for ticker, name in MACRO_SYMBOLS.items():
-            entry = self.market["quotes"][ticker]
-            indicators[ticker] = {"name": name, "price_usd": entry["price"], "change_pct": entry["day_change_pct"],
-                                  "as_of_et": entry["time"].isoformat() if entry["time"] else None}
-        quote_dates = {row["as_of_et"][:10] if row["as_of_et"] else None for row in indicators.values()}
-        changes = [indicators[symbol]["change_pct"] for symbol in ("SPY", "QQQ", "VIXY")]
+        marks = self.market.get("benchmarks", {})
+        indicators = {ticker: {"name": name, **(marks.get(ticker) or {})} for ticker, name in MACRO_SYMBOLS.items()}
+        quote_dates = {row.get("session_date") for row in indicators.values()}
+        changes = [indicators[symbol].get("move") for symbol in ("^GSPC", "^NDX", "^VIX")]
         regime = "Awaiting comparable benchmark quotes"
         if len(quote_dates) == 1 and None not in quote_dates and all(value is not None for value in changes):
             broad, tech, volatility = changes
             if broad > 0 and tech > 0 and volatility < 0:
-                regime = "Broad and tech equities rose while volatility futures fell"
+                regime = "Broad and tech equities rose while VIX fell"
             elif broad < 0 and tech < 0 and volatility > 0:
-                regime = "Broad and tech equities fell while volatility futures rose"
+                regime = "Broad and tech equities fell while VIX rose"
             else:
                 regime = "Mixed equity and volatility signals"
-        return {"source": "Finnhub", "indicators": indicators, "regime": regime,
-                "basis": "US-listed fund prices. IEF holds Treasury bonds. VIXY tracks short-term VIX futures."}
+        return {"source": "Yahoo chart data", "indicators": indicators, "regime": regime,
+                "basis": "Index values are in points with percentage changes. The 10-year yield is in percent with a basis-point change."}
 
     def tool_search_live_news(self, topic_or_ticker: str):
         if not isinstance(topic_or_ticker, str):
@@ -1342,10 +1492,10 @@ class GICMarketAgent:
 
     @staticmethod
     def macro_text(macro):
-        lines = ["**Benchmark funds · Finnhub**", macro["regime"] + ". " + macro["basis"]]
+        lines = ["**Market benchmarks**", macro["regime"] + ". " + macro["basis"]]
         for ticker, row in macro["indicators"].items():
-            lines.append(f"- **{row['name']}** ({ticker}) `{price_text(row['price_usd'])}` "
-                         f"· {percent(row['change_pct'])} · {row['as_of_et'] or 'time unavailable'}")
+            lines.append(f"- **{row['name']}** ({ticker}) `{benchmark_price(row)}` "
+                         f"· {benchmark_change(row)} · {row.get('as_of_et', 'time unavailable')}")
         return "\n".join(lines)
 
     @staticmethod
@@ -1534,224 +1684,237 @@ class GICMarketAgent:
 
 TERMINAL_CSS = """
 <style>
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650;700;750&family=JetBrains+Mono:wght@400;500;600;700&display=swap");
+
 :root {
   color-scheme: dark;
-  --page: #06080d; --panel: #0c101a; --line: #1c2538;
-  --muted: #99a8c2; --subtle: #788aa8; --bright: #edf4ff;
-  --cyan: #00e5ff; --green: #00ff88; --red: #ff2a5f;
-  --font: "JetBrains Mono", "Fira Code", ui-monospace, Consolas, monospace;
+  --page: #070A11;
+  --panel: linear-gradient(180deg, #0C121E 0%, #080C14 100%);
+  --line: rgba(255, 255, 255, .06);
+  --bright: #F8FAFC;
+  --muted: #94A3B8;
+  --subtle: #64748B;
+  --up: #FFD60A;
+  --green: #00FF88;
+  --red: #FF2A5F;
+  --sans: "Inter", system-ui, sans-serif;
+  --font: "JetBrains Mono", ui-monospace, Consolas, monospace;
   --gic-dashboard-height: calc(100vh - 88px);
   --gic-grid: calc(var(--gic-dashboard-height) - 49px);
-  --gic-chart: max(333px, calc(var(--gic-grid) * .45 - 6px));
-  --gic-copilot: calc(var(--gic-grid) - var(--gic-chart) - 12px);
-  --gic-chat: calc(var(--gic-copilot) - 151px);
+  --gic-chart: max(337px, calc(var(--gic-grid) * .46 - 7px));
+  --gic-copilot: calc(var(--gic-grid) - var(--gic-chart) - 14px);
+  --gic-chat: calc(var(--gic-copilot) - 180px);
 }
-html, body, [data-testid="stAppViewContainer"] { height: 100vh; overflow: hidden; background: var(--page); }
+html, body, [data-testid="stAppViewContainer"] {
+  height: 100vh; overflow: hidden; background: var(--page);
+}
 .stApp, .stMain { background: var(--page); color: var(--bright); overflow: hidden; }
-.stApp { font-family: var(--font); font-variant-numeric: tabular-nums; }
+.stApp { font-family: var(--sans); font-variant-numeric: tabular-nums; }
 [data-testid="stStatusWidget"], [data-testid="stSpinner"] { display: none !important; }
 .stApp [data-stale="true"] { opacity: 1 !important; transition: none !important; }
-.stMainBlockContainer { max-width: 1840px; padding: 12px 23px 0; }
-.stMainBlockContainer [data-testid="stVerticalBlock"] { gap: 10px; }
-.stMainBlockContainer [data-testid="stHorizontalBlock"] { gap: 12px; align-items: start; }
-[data-testid="stHeader"] { background: transparent; height: 44px; }
+.stMainBlockContainer { max-width: 1880px; padding: 12px 24px 0; }
+.stMainBlockContainer [data-testid="stVerticalBlock"],
+.stMainBlockContainer [data-testid="stHorizontalBlock"] { gap: 14px; }
+[data-testid="stHeader"] { background: transparent; height: 46px; }
 [data-testid="stHeader"], [data-testid="stHeader"] * { pointer-events: none !important; }
 [data-testid="stHeader"] [data-testid="stExpandSidebarButton"] { pointer-events: auto !important; }
-[data-testid="stExpandSidebarButton"] { border: 1px solid #264458; background: #101e2b; border-radius: 6px; padding: 2px; }
-[data-testid="stExpandSidebarButton"] span, [data-testid="stSidebar"] button span { color: var(--cyan); }
-footer, #MainMenu, [data-testid="stDecoration"], [data-testid="stToolbarActions"], [data-testid="stAppDeployButton"] { display: none; }
-[data-testid="stSidebar"], [data-testid="stSidebarContent"] { background: #0b101a; color: var(--bright); }
-[data-testid="stSidebar"] p, [data-testid="stSidebar"] h2 { color: var(--bright); }
-[data-testid="stSidebar"] [data-baseweb="select"] > div,
-[data-baseweb="popover"] [role="listbox"] { background: #101b2b; color: var(--bright); }
-.st-key-gic_command {
-  min-height: 63px; padding: 7px 13px 8px 43px; border: 1px solid #23344b;
-  border-radius: 10px; background: linear-gradient(100deg, #101b2b, #0a0f19 46%);
+[data-testid="stExpandSidebarButton"] {
+  color: var(--bright); background: #121927; border: 1px solid var(--line); border-radius: 10px;
 }
+footer, #MainMenu, [data-testid="stDecoration"], [data-testid="stToolbarActions"],
+[data-testid="stAppDeployButton"] { display: none; }
+[data-testid="stSidebar"], [data-testid="stSidebarContent"] { background: #0C121E; color: var(--bright); }
+[data-testid="stSidebarContent"] { padding-bottom: 44px; }
+[data-testid="stSidebar"] :is(p,h2) { color: var(--bright); }
+[data-testid="stSidebar"] [data-baseweb="select"] > div,
+[data-baseweb="popover"] [role="listbox"] { background: #111928; color: var(--bright); }
+
+.st-key-gic_command, .st-key-gic_holdings, .st-key-gic_chart, .st-key-gic_copilot {
+  box-sizing: border-box; min-width: 0; padding: 16px 18px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, .35);
+}
+.st-key-gic_command { min-height: 64px; padding: 11px 18px 11px 43px; }
 .st-key-gic_command [data-testid="stHorizontalBlock"] { align-items: center; }
-.st-key-gic_command [data-testid="stWidgetLabel"] p { font: 650 10px var(--font); color: var(--bright); white-space: nowrap; }
 .gic-brand { display: flex; align-items: center; gap: 11px; white-space: nowrap; }
-.gic-logo { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 7px; border: 1px solid #1b7283; background: #112c3d; color: var(--cyan); font-size: 19px; }
-.gic-title { margin: 0; padding: 0; color: var(--bright); font: 800 clamp(13px,1.13vw,20px)/1.2 var(--font); letter-spacing: -.03em; }
+.gic-logo {
+  display: grid; place-items: center; width: 37px; height: 37px; flex: 0 0 37px;
+  border-radius: 12px; background: #182133; color: var(--up); font: 700 21px var(--font);
+  text-shadow: 0 0 11px #FFD60A59;
+}
+.gic-title { margin: 0; padding: 0; color: var(--bright); font: 750 clamp(14px,1.2vw,22px)/1.2 var(--sans); }
 .stMainBlockContainer .st-key-gic_header_pulse, .gic-market-pulse {
-  display: flex; align-items: center; justify-content: flex-end; gap: clamp(5px,1vw,19px);
-  flex-wrap: nowrap; white-space: nowrap;
+  display: flex; align-items: center; justify-content: flex-end;
+  gap: clamp(9px,1.12vw,20px); flex-wrap: nowrap; white-space: nowrap;
 }
 .st-key-gic_header_pulse > [data-testid="stLayoutWrapper"] { flex: 0 0 auto; width: max-content; }
-.gic-clocks { display: flex; align-items: center; gap: 9px; }
-.gic-clocks .gic-clock + .gic-clock { border-left: 1px solid #30415b; padding-left: 9px; }
-.gic-clock { color: var(--muted); font: 650 11px var(--font); }
-.gic-clock time { color: #b9e8fa; font-weight: 750; }
-.gic-session, .gic-tag, .gic-tool {
-  border: 1px solid #1e4b5b; background: #0c2733; color: #75edff; border-radius: 5px;
-  font: 700 10px var(--font); padding: 4px 6px; white-space: nowrap;
+.gic-clocks { display: flex; align-items: center; gap: clamp(6px,.8vw,14px); }
+.gic-clock { color: var(--muted); font: 500 11px var(--font); }
+.gic-clock time { color: var(--bright); font-weight: 600; }
+.gic-session {
+  display: flex; align-items: center; gap: 6px; font: 650 11px var(--sans); color: var(--up);
 }
-.gic-session:not(.closed) { text-shadow: 0 0 9px #00e5ff; box-shadow: 0 0 10px #00e5ff25; }
-.gic-session.closed { background: #191f2c; border-color: #354158; color: #a8b9d2; }
-.gic-macro { display: flex; align-items: baseline; gap: clamp(6px,.9vw,17px); border-left: 1px solid #30415b; padding-left: 10px; }
-.gic-macro b { color: var(--bright); font-weight: 700; }
-.gic-macro span { color: var(--muted); font: 10px var(--font); }
-.gic-macro small { font: inherit; }
-.gic-tag.gic-connected { color: #00FF88; border-color: #23503a; background: #102719; text-shadow: 0 0 7px #00ff8855; }
-.gic-tag.gic-waiting { color: #ffbf69; border-color: #594325; background: #221c18; }
-.st-key-gic_holdings, .st-key-gic_chart, .st-key-gic_copilot {
-  padding: 12px; background: var(--panel); border: 1px solid var(--line);
-  border-radius: 10px; box-shadow: 0 0 17px #00ddff0a;
-  min-width: 0;
+.gic-session::before {
+  content: ""; width: 5px; height: 5px; border-radius: 50%;
+  background: currentColor; box-shadow: 0 0 9px currentColor;
 }
-.st-key-gic_holdings { min-height: var(--gic-grid); }
+.gic-session.closed { color: var(--subtle); }
+.gic-session.closed::before { box-shadow: none; }
+.gic-macro { display: flex; align-items: center; gap: clamp(10px,1.3vw,23px); }
+.gic-macro-reading { display: grid; gap: 3px; color: var(--muted); font: 600 10px var(--sans); }
+.gic-macro-value { display: flex; align-items: baseline; gap: 5px; font: 500 10px var(--font); }
+.gic-macro-value b { color: var(--bright); font-weight: 700; }
+.gic-macro-value small { font: inherit; }
+.gic-gain { color: var(--up); }
+.gic-loss { color: var(--red); }
+.gic-muted { color: var(--muted); }
+
+.st-key-gic_holdings { height: var(--gic-grid); }
 .st-key-gic_chart { height: var(--gic-chart); }
 .st-key-gic_copilot { height: var(--gic-copilot); }
 .st-key-gic_holdings [data-testid="stVerticalBlock"],
-.st-key-gic_chart [data-testid="stVerticalBlock"], .st-key-gic_copilot [data-testid="stVerticalBlock"] { gap: 8px; }
+.st-key-gic_chart [data-testid="stVerticalBlock"],
+.st-key-gic_copilot [data-testid="stVerticalBlock"] { gap: 10px; }
 .gic-panel-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.gic-panel-top h2 { color: var(--bright); margin: 0; padding: 0; font: 750 15px/1.2 var(--font); }
-.gic-panel-meta { color: var(--muted); font: 10px var(--font); margin-top: 5px; }
-.gic-table-wrap {
-  max-height: calc(var(--gic-grid) - 206px); overflow: auto; border: 1px solid #202d44;
-  border-radius: 6px; scrollbar-color: #36506d #0e1522;
+.gic-panel-top h2 {
+  margin: 0; padding: 0; color: var(--bright); font: 750 18px/1.25 var(--sans); letter-spacing: -.025em;
 }
-.gic-table { width: 100%; min-width: 615px; border-collapse: separate; border-spacing: 0; white-space: nowrap; }
-.gic-table th {
-  position: sticky; top: 0; z-index: 1; text-align: right; padding: 8px 8px;
-  font: 700 10px var(--font); color: #aebbd1; background: #101827; text-transform: uppercase; letter-spacing: .04em;
+.gic-panel-meta { color: var(--muted); font: 500 11px/1.4 var(--sans); margin-top: 4px; }
+
+.st-key-gic_stock_controls [data-baseweb="input"],
+.st-key-gic_copilot [data-baseweb="input"] {
+  min-height: 38px; background: #131B2A; border: 1px solid var(--line); border-radius: 999px;
 }
-.gic-table td { border-top: 1px solid #20293b; padding: 0 8px; height: clamp(29px, calc((var(--gic-grid) - 248px) / 14), 47px); text-align: right; color: var(--bright); font: 650 12px var(--font); }
-.gic-table :is(td,th):first-child { text-align: left; }
-.gic-table tr { cursor: pointer; }
-.gic-table tbody tr:nth-child(even) { background: #101522; }
-.gic-table tbody tr:hover { background: #153245; }
-.gic-table tbody tr.current { background: #102c3a; }
-.gic-table .current td:first-child { box-shadow: inset 2px 0 var(--cyan); }
-.gic-table .break-up { background: #00ff8811; }
-.gic-table .break-down { background: #ff2a5f15; }
-.gic-table .break-up .gic-ext-change { text-shadow: 0 0 10px #00ff8870; }
-.gic-table .break-down .gic-ext-change { text-shadow: 0 0 10px #ff2a5f80; }
-.gic-symbol {
-  all: unset; cursor: pointer; background: #131f31; color: #d6ebff;
-  min-width: 50px; text-align: center; padding: 4px 4px;
-  border: 1px solid #2d415c; border-radius: 4px; font: 750 12px var(--font);
+.st-key-gic_stock_controls [data-baseweb="base-input"],
+.st-key-gic_copilot [data-baseweb="base-input"] { background: transparent; border-radius: inherit; }
+.st-key-gic_stock_controls input, .st-key-gic_copilot input {
+  color: var(--bright); font: 500 12px var(--sans); background: transparent;
 }
-.gic-symbol:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
-.gic-table .current .gic-symbol { color: var(--cyan); border-color: #25788d; }
-.gic-name, .gic-ext-session { color: var(--muted); padding-left: 7px; font-size: 10px; font-weight: 450; }
-.gic-table .gic-reg-close { color: var(--muted); }
-.gic-table .gain, .gic-gain { color: var(--green); }
-.gic-table .loss, .gic-loss { color: var(--red); }
-.gic-table .muted { color: var(--muted); }
-.gic-rule-strip { margin-top: 5px; display: flex; gap: 8px; flex-wrap: wrap; }
-.gic-rule-strip span { border: 1px solid #254057; background: #101b2a; padding: 6px 8px; border-radius: 5px; color: var(--muted); font: 10px var(--font); }
-.gic-rule-strip b { color: var(--bright); }
-.gic-chart-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.gic-chart-price { font: 750 21px var(--font); color: var(--bright); white-space: nowrap; }
-.gic-chart-price small { font-size: 10px; }
+.st-key-gic_stock_controls input::placeholder, .st-key-gic_copilot input::placeholder { color: var(--muted); }
+.st-key-gic_stock_controls button, .st-key-gic_copilot button[data-testid="stBaseButton-secondary"],
+.st-key-gic_copilot [data-testid="stFormSubmitButton"] button,
+.st-key-gic_copilot [data-testid="stDownloadButton"] button {
+  min-height: 31px; padding: 3px 12px; border: 1px solid transparent;
+  border-radius: 999px; background: #151E2D; color: var(--bright);
+}
+.st-key-gic_stock_controls button p, .st-key-gic_copilot button p {
+  font: 650 11px var(--sans); white-space: nowrap;
+}
+.st-key-gic_stock_controls button:hover, .st-key-gic_copilot button:hover { background: #1C293C; }
+.st-key-gic_stock_controls button:is([aria-pressed="true"], [aria-checked="true"], [data-testid="stBaseButton-pillsActive"]) {
+  color: var(--up); background: #FFD60A13;
+}
+.st-key-gic_stock_controls button:disabled, .st-key-gic_copilot button:disabled { color: var(--subtle); }
+.gic-directory-meta, .gic-page {
+  color: var(--muted); font: 500 11px var(--font); white-space: nowrap;
+}
+.gic-directory-meta { overflow: hidden; text-overflow: ellipsis; }
+.gic-page { text-align: center; }
+.gic-portfolio-strip {
+  display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 12px;
+  padding: 6px 16px 8px; margin: 0; border-bottom: 1px solid var(--line);
+}
+.gic-portfolio-strip dt { color: var(--muted); font: 500 11px var(--sans); }
+.gic-portfolio-strip dd { margin: 4px 0 0; font: 600 14px var(--font); }
+.gic-watchlist {
+  max-height: max(120px, calc(var(--gic-grid) - 248px)); overflow: auto;
+  scrollbar-color: #26344A transparent; scrollbar-width: thin; scrollbar-gutter: stable;
+}
+.gic-watch-row {
+  display: grid; grid-template-columns: minmax(0,1fr) 88px minmax(116px,.47fr);
+  gap: clamp(10px,1.4vw,24px); align-items: center; padding: 11px 16px;
+  color: inherit !important; text-decoration: none !important;
+  border-bottom: 1px solid rgba(255, 255, 255, .04); border-radius: 10px;
+  transition: background-color .18s ease;
+}
+.gic-watch-row:hover { background: #FFFFFF09; }
+.gic-watch-row[aria-current="true"] { background: #FFD60A0C; }
+.gic-watch-row:focus-visible { outline: 1px solid var(--up); outline-offset: -2px; }
+.gic-stock-identity { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.gic-company-logo {
+  position: relative; display: grid; place-items: center; width: 36px; height: 36px; flex: 0 0 36px;
+  border-radius: 50%; overflow: hidden; color: #D5DFEB; background: #1C293B; font: 600 12px var(--font);
+}
+.gic-company-logo img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; background: #111928; }
+.gic-company-logo img:not(.loaded) { visibility: hidden; }
+.gic-stock-name, .gic-stock-symbol { display: block; }
+.gic-stock-name {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #F8FAFC;
+  font: 600 14px/1.3 var(--sans);
+}
+.gic-stock-symbol { margin-top: 3px; color: #64748B; font: 500 11.5px/1.2 var(--font); }
+.gic-stock-label { min-width: 0; }
+.gic-spark { display: block; width: 88px; height: 28px; justify-self: center; }
+.gic-spark path { stroke: currentColor; filter: drop-shadow(0 0 3px currentColor); }
+.gic-spark.empty::before {
+  content: ""; display: block; width: 18px; margin: 14px auto 0;
+  border-top: 1px solid rgba(148, 163, 184, .24);
+}
+.gic-stock-quote { display: grid; gap: 3px; text-align: right; white-space: nowrap; font-family: var(--font); }
+.gic-stock-last { color: #F8FAFC; font: 700 15px/1.2 var(--font); }
+.gic-stock-change { font: 600 11px/1.2 var(--font); }
+.gic-stock-change.gic-gain { text-shadow: 0 0 7px #FFD60A52; }
+.gic-stock-change.gic-loss { text-shadow: 0 0 7px #FF2A5F52; }
+.gic-empty { padding: 24px 16px; color: var(--muted); font: 500 13px var(--sans); }
+.gic-chart-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .st-key-gic_plot_frame, .st-key-gic_plot_frame [data-testid="stPlotlyChart"] {
-  height: calc(var(--gic-chart) - 88px); min-height: 245px; background: #0B101B;
+  height: calc(var(--gic-chart) - 92px); min-height: 245px; background: #0B101B; border-radius: 12px;
 }
-@media (max-width: 1450px) { .gic-macro small { display: none; } }
-.gic-legend { display: flex; gap: 12px; color: var(--muted); font: 10px var(--font); }
-.gic-legend i { display: inline-block; width: 7px; height: 7px; border-radius: 2px; margin-right: 5px; }
-.st-key-gic_copilot .gic-tag { background: #102719; border-color: #23503a; color: #77efb3; }
-.st-key-gic_copilot button[data-testid="stBaseButton-secondary"] {
-  color: #bff8ff; background: #101e2a; border: 1px solid #254457;
-  min-height: 32px; padding: 2px 5px; border-radius: 5px;
-}
-.st-key-gic_copilot button[data-testid="stBaseButton-secondary"] p { font: 700 10px var(--font); }
-.st-key-gic_copilot button[data-testid="stBaseButton-secondary"]:hover { background: #163442; border-color: #34aac0; color: #effeff; }
+.st-key-gic_plot_frame [data-testid="stPlotlyChart"] { overflow: hidden; }
+.st-key-gic_chart [data-testid="stWidgetLabel"] p { color: var(--muted); font: 650 11px var(--sans); white-space: nowrap; }
+.st-key-gic_chart [data-baseweb="checkbox"]:has(input:checked) > div:first-child { background: #A38709; }
+
 .st-key-gic_copilot [data-testid="stLayoutWrapper"]:has(> .st-key-gic_messages) {
   height: var(--gic-chat) !important; flex: 0 0 var(--gic-chat); min-height: 0; max-height: var(--gic-chat);
 }
 .st-key-gic_messages {
-  height: 100% !important; min-height: 0; max-height: 100%; overflow-y: auto; overflow-x: hidden;
-  gap: 8px !important; background: #080d16;
-  border: 1px solid #1b2a42; border-radius: 6px; padding: 8px; scrollbar-color: #36506d #0e1522;
+  height: 100% !important; min-height: 0; max-height: 100%; overflow: hidden auto;
+  gap: 10px !important; background: #080D17; border-radius: 12px; padding: 9px;
+  scrollbar-color: #26344A transparent; scrollbar-width: thin;
 }
-.st-key-gic_messages [data-testid="stChatMessage"] { background: #101726; color: var(--bright); padding: 8px; }
-.st-key-gic_messages [data-testid="stChatMessage"] p,
-.st-key-gic_messages [data-testid="stChatMessage"] li { color: #deebff; font: 12px/1.52 var(--font); }
+.st-key-gic_messages [data-testid="stChatMessage"] {
+  background: #121B2A; color: var(--bright); border-radius: 12px; padding: 10px 12px;
+}
+.st-key-gic_messages [data-testid="stChatMessage"] :is(p,li) { color: #E2E8F0; font: 13px/1.55 var(--sans); }
 .st-key-gic_messages [data-testid="stChatMessage"] p { margin-bottom: .35rem; }
-.st-key-gic_messages [data-testid="stChatMessage"] :is(code,a) { color: #8deeff; }
-.st-key-gic_messages [data-testid="stChatMessage"] code { background: #1b2c3c; }
-.gic-badges { display: flex; gap: 5px; align-items: center; flex-wrap: wrap; margin-bottom: 3px; }
-.gic-badges .gic-tool { font-size: 9px; color: #a3eafa; }
-.gic-engine { color: var(--muted); font: 9px var(--font); }
-.gic-copilot-meta { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
-.gic-agent-active {
-  color: #77ffb7; font-weight: 800; border: 1px solid #23553c; background: #11291e;
-  border-radius: 4px; padding: 1px 4px; text-shadow: 0 0 8px #00ff8850; box-shadow: 0 0 8px #00ff8828;
-}
-.gic-learned { color: #afdef1; }
-.gic-pending { color: var(--muted); font: 10px var(--font); padding: 2px 6px; }
-
+.st-key-gic_messages [data-testid="stChatMessage"] :is(code,a) { color: #F5DC6E; }
+.st-key-gic_messages [data-testid="stChatMessage"] code { background: #1A2537; }
+.gic-tool-line, .gic-pending { color: var(--muted); font: 500 11px/1.4 var(--sans); }
+.gic-tool-line { margin-bottom: 4px; }
+.gic-copilot-meta { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.gic-agent-active { color: #89E6B3; font-weight: 650; }
+.gic-learned { color: var(--subtle); }
 .st-key-gic_copilot [data-testid="stForm"] { padding: 0; }
-.st-key-gic_copilot [data-testid="stTextInput"] [data-baseweb="input"] {
-  background: #101929; border-color: #263c53; border-radius: 6px; min-height: 34px;
-}
-.st-key-gic_copilot [data-testid="stTextInput"] [data-baseweb="base-input"] { background: #101929; }
-.st-key-gic_copilot [data-testid="stTextInput"] input { color: var(--bright); font: 12px var(--font); background: transparent; }
-.st-key-gic_copilot [data-testid="stTextInput"] input::placeholder { color: #93a5be; }
-.st-key-gic_copilot [data-testid="stFormSubmitButton"] button,
-.st-key-gic_copilot [data-testid="stDownloadButton"] button {
-  color: #bff8ff; background: #101e2a; border: 1px solid #254457;
-  min-height: 30px; padding: 2px 6px; border-radius: 5px;
-}
-.st-key-gic_copilot [data-testid="stDownloadButton"] button:disabled { color: var(--subtle); opacity: .75; }
-.st-key-gic_copilot [data-testid="stFormSubmitButton"] button p,
-.st-key-gic_copilot [data-testid="stDownloadButton"] button p,
-.st-key-gic_chart [data-testid="stWidgetLabel"] p { font: 700 10px var(--font); white-space: nowrap; }
-.st-key-gic_chart [data-testid="stWidgetLabel"] p { color: #bff8ff; }
-.st-key-gic_chart [data-baseweb="checkbox"]:has(input:checked) > div:first-child { background: #168a9c; }
-.gic-portfolio-strip { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 8px; }
-.gic-portfolio-strip > div { border: 1px solid #253650; background: #111a2b; border-radius: 6px; padding: 7px 9px; }
-.gic-portfolio-strip span { color: var(--muted); font: 10px var(--font); }
-.gic-portfolio-strip strong { display: block; margin-top: 4px; font: 700 16px/1.05 var(--font); }
 .st-key-gic_copilot [data-testid="stHorizontalBlock"] { align-items: center; }
-@media (max-width: 1430px) { .gic-name { display: none; } }
-@media (max-width: 1180px) {
-  .stMainBlockContainer .st-key-gic_header_pulse, .gic-market-pulse, .gic-macro, .gic-clocks { gap: 5px; }
-  .gic-clocks .gic-clock + .gic-clock { padding-left: 5px; }
-  .gic-ext-session { display: none; }
+.st-key-gic_copilot [data-testid="stFormSubmitButton"] button {
+  min-height: 38px; color: #171500; background: #FFD60A;
 }
-@media (max-width: 950px) { .gic-macro { display: none; } .gic-logo { display: none; } }
+.st-key-gic_copilot [data-testid="stFormSubmitButton"] button:hover { background: #FFE058; }
+
+@media (max-width: 1350px) {
+  .gic-clock, .gic-macro-value { font-size: 9px; }
+  .gic-clocks, .gic-macro { gap: 8px; }
+  .gic-watch-row { gap: 10px; }
+}
+@media (max-width: 1150px) {
+  :root { --gic-grid: calc(var(--gic-dashboard-height) - 74px); }
+  .stMainBlockContainer .st-key-gic_header_pulse { flex-wrap: wrap; row-gap: 5px; }
+  .gic-watch-row { grid-template-columns: minmax(0,1fr) 64px minmax(100px,auto); padding-inline: 10px; }
+  .gic-spark { width: 64px; }
+}
+@media (max-width: 760px) {
+  :root { --gic-chart: 337px; --gic-copilot: 415px; }
+  html, body, [data-testid="stAppViewContainer"], .stApp, .stMain { overflow-y: auto; }
+  .stMainBlockContainer { padding: 10px 14px 55px; }
+  .st-key-gic_command { padding-left: 40px; }
+  .stMainBlockContainer .st-key-gic_header_pulse, .gic-market-pulse { justify-content: flex-start; flex-wrap: wrap; }
+  .st-key-gic_holdings { height: auto; }
+  .gic-watchlist { max-height: 460px; }
+}
+@media (prefers-reduced-motion: reduce) { .gic-watch-row { transition: none; } }
 </style>
 """
 
-STOCK_BROWSER_CSS = """
-<style>
-.st-key-gic_stock_controls [data-baseweb="input"] {
-  background: #101929; border-color: #263c53; border-radius: 6px;
-}
-.st-key-gic_stock_controls [data-baseweb="base-input"] { background: #101929; }
-.st-key-gic_stock_controls input {
-  color: var(--bright); font: 11px var(--font); background: transparent;
-}
-.st-key-gic_stock_controls input::placeholder { color: var(--muted); }
-.st-key-gic_stock_controls button {
-  color: #bff8ff; background: #101e2a; border: 1px solid #254457;
-  min-height: 30px; padding: 2px 7px;
-}
-.st-key-gic_stock_controls button p { font: 700 10px var(--font); white-space: nowrap; }
-.st-key-gic_stock_controls button:is([aria-pressed="true"], [aria-checked="true"]) {
-  color: var(--cyan); background: #102c3a; border-color: #25788d;
-}
-.st-key-gic_stock_controls button:disabled { color: var(--subtle); }
-.gic-directory-meta, .gic-page {
-  color: var(--muted); font: 10px var(--font); white-space: nowrap;
-}
-.gic-directory-meta { overflow: hidden; text-overflow: ellipsis; }
-.gic-page { text-align: center; }
-.st-key-gic_holdings .gic-table-wrap { max-height: max(75px, calc(var(--gic-grid) - 296px)); }
-.st-key-gic_holdings .gic-table td {
-  height: clamp(29px, calc((var(--gic-grid) - 330px) / 20), 47px);
-}
-.st-key-gic_holdings .gic-name {
-  max-width: 170px; overflow: hidden; text-overflow: ellipsis; vertical-align: middle;
-}
-@media (min-width: 1431px) {
-  .st-key-gic_holdings .gic-name { display: inline-block; }
-}
-</style>
-"""
 
 EXCHANGE_TICKER_CSS = """
 .gic-exchange-strip {
@@ -1838,55 +2001,65 @@ export default function({data, parentElement}) {
 
 
 HOLDING_COMPONENT_JS = """
-export default function(component) {
-    const { data, setTriggerValue, parentElement } = component;
-    let table = parentElement.querySelector('.gic-table-wrap');
-    if (table && parentElement.gicMarkup === data) return;
+export default function({data, setTriggerValue, parentElement}) {
+    let list = parentElement.querySelector('.gic-watchlist');
+    if (list && parentElement.gicMarkup === data) return;
     const template = document.createElement('template');
     template.innerHTML = data;
     const next = template.content.firstElementChild;
     parentElement.gicMarkup = data;
 
-    if (!table || table.dataset.page !== next.dataset.page) {
+    if (!list || list.dataset.page !== next.dataset.page) {
         parentElement.replaceChildren(next);
-        table = next;
+        list = next;
+        // Keep the monogram visible while the logo loads and on image errors.
+        for (const image of list.querySelectorAll('.gic-company-logo img')) {
+            const reveal = () => {
+                if (image.naturalWidth > 0) image.classList.add('loaded');
+            };
+            image.addEventListener('load', reveal, {once: true});
+            image.addEventListener('error', () => { image.hidden = true; }, {once: true});
+            if (image.complete) reveal();
+        }
+    } else if (!list.dataset.page) {
+        if (list.innerHTML !== next.innerHTML) list.innerHTML = next.innerHTML;
     } else {
-        const incoming = next.querySelectorAll('tbody tr');
+        const incoming = next.querySelectorAll('.gic-watch-row');
         const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
-        table.querySelectorAll('tbody tr').forEach((row, index) => {
+        list.querySelectorAll('.gic-watch-row').forEach((row, index) => {
             const update = incoming[index];
-            if (row.className !== update.className) row.className = update.className;
-            Array.from(row.cells).forEach((cell, column) => {
-                const replacement = update.cells[column];
-                if (cell.className !== replacement.className) cell.className = replacement.className;
-                if (cell.title !== replacement.title) cell.title = replacement.title;
-                if (cell.innerHTML === replacement.innerHTML) return;
-                const button = cell.querySelector('.gic-symbol');
-                if (button) {
-                    const nextButton = replacement.querySelector('.gic-symbol');
-                    button.setAttribute('aria-pressed', nextButton.getAttribute('aria-pressed'));
-                    button.title = nextButton.title;
-                    cell.querySelector('.gic-name').textContent = replacement.querySelector('.gic-name').textContent;
-                } else {
-                    cell.innerHTML = replacement.innerHTML;
-                }
-                const move = replacement.dataset.priceMove;
-                if (!move || reduceMotion) return;
-                cell.getAnimations().forEach((animation) => animation.cancel());
-                const accent = move === 'gain' ? '#00ff88' : '#ff2a5f';
-                cell.animate([
-                    {color: accent, textShadow: `0 0 12px ${accent}`},
-                    {color: getComputedStyle(cell).color, textShadow: 'none'},
-                ], {duration: 450, easing: 'ease'});
-            });
+            const selected = update.getAttribute('aria-current');
+            if (row.getAttribute('aria-current') !== selected) row.setAttribute('aria-current', selected);
+            for (const selector of ['.gic-stock-name', '.gic-stock-change', '.gic-spark']) {
+                const element = row.querySelector(selector);
+                const replacement = update.querySelector(selector);
+                if (element.outerHTML !== replacement.outerHTML) element.replaceWith(replacement);
+            }
+
+            const last = row.querySelector('.gic-stock-last');
+            const nextLast = update.querySelector('.gic-stock-last');
+            if (last.title !== nextLast.title) last.title = nextLast.title;
+            if (last.textContent === nextLast.textContent) return;
+            last.textContent = nextLast.textContent;
+            if (!nextLast.dataset.move || reduceMotion) return;
+            const accent = nextLast.dataset.move === 'gain' ? '#FFD60A' : '#FF2A5F';
+            last.getAnimations().forEach(animation => animation.cancel());
+            last.animate([
+                {color: accent, textShadow: '0 0 10px ' + accent},
+                {color: '#F8FAFC', textShadow: 'none'},
+            ], {duration: 450, easing: 'ease'});
         });
     }
-    table.onclick = (event) => {
-        const row = event.target.closest('tr[data-ticker]');
-        if (row) setTriggerValue('ticker', row.dataset.ticker);
+    list.onclick = (event) => {
+        const row = event.target.closest('.gic-watch-row');
+        if (!row || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+        // Use the normal link for new tabs and the component trigger in this session.
+        event.preventDefault();
+        setTriggerValue('select', row.dataset.ticker);
     };
 }
 """
+
 
 CHAT_SCROLL_JS = """
 export default function({data, parentElement}) {
@@ -1957,77 +2130,128 @@ def chart_figure(selected_ticker, relative):
         fig.update_xaxes(ticksuffix=" pp")
         fig.update_yaxes(type="category", automargin=True)
     else:
-        fig.add_scatter(x=[], y=[], xaxis="x2", mode="markers", uid="references",
-                        marker={"size": 7, "color": "#FFBC67"}, name="Quote references",
-                        hovertemplate="%{x} · $%{y:,.2f}<extra></extra>")
-        fig.add_scatter(x=[], y=[], mode="lines+markers", uid="trades", name=selected_ticker,
-                        line={"color": "#00E5FF", "width": 2}, marker={"size": 4},
-                        hovertemplate="%{x|%H:%M:%S} ET · $%{y:,.2f}<extra></extra>")
-        fig.update_xaxes(type="date", domain=[.29, 1.], tickformat="%H:%M:%S", nticks=5)
-        fig.update_layout(xaxis2={"domain": [0., .23], "type": "category", "tickangle": 0,
-                                  "tickfont": {"size": 9}, "showgrid": False, "visible": False})
+        # An invisible baseline fills the area without forcing the y-axis to include zero.
+        fig.add_scatter(x=[], y=[], mode="lines", uid="baseline", line={"width": 0}, hoverinfo="skip")
+        fig.add_scatter(
+            x=[], y=[], mode="lines", uid="session", name=selected_ticker, fill="tonexty",
+            line={"color": "#FFD60A", "width": 2, "shape": "spline", "smoothing": .6},
+            fillcolor="rgba(255,214,10,.11)", hovertemplate="%{x|%b %d, %H:%M} ET · $%{y:,.2f}<extra></extra>",
+        )
+        fig.update_xaxes(type="date", tickformat="%b %d\n%H:%M", nticks=6, showgrid=False)
         fig.update_yaxes(tickprefix="$", side="right", nticks=5, automargin=True)
     fig.update_layout(
-        template="plotly_dark", margin={"l": 6, "r": 8, "t": 8, "b": 26},
+        template="plotly_dark", margin={"l": 10, "r": 10, "t": 10, "b": 32},
         paper_bgcolor="#0B101B", plot_bgcolor="#0B101B", showlegend=False, dragmode="zoom",
-        font={"family": "monospace", "color": "#a6b6cf", "size": 10}, uirevision=selected_ticker,
+        font={"family": "JetBrains Mono, monospace", "color": "#94A3B8", "size": 10},
+        uirevision=selected_ticker,
     )
-    fig.update_xaxes(visible=False, gridcolor="#1e2a42")
-    fig.update_yaxes(visible=False, zeroline=False, gridcolor="#1e2a42")
+    fig.update_xaxes(visible=False, gridcolor="rgba(148,163,184,.08)")
+    fig.update_yaxes(visible=False, zeroline=False, gridcolor="rgba(148,163,184,.08)")
     return fig
 
 
-def chart_update(feed, selected, symbols, relative, plot_key):
+def quote_direction(entry):
+    amount = number(entry.get("day_change_usd"))
+    move = amount if amount is not None else number(entry.get("day_change_pct"))
+    if move is None:
+        return "muted"
+    return "gain" if move >= 0 else "loss"
+
+
+def price_stack(entry, animation=""):
+    price = entry.get("price")
+    stamp = entry.get("time")
+    title = f"Finnhub quote · {stamp:%b %d %H:%M:%S ET}" if stamp else "Finnhub quote"
+    tone = quote_direction(entry)
+    amount = metric(entry.get("day_change_usd"), "+,.2f")
+    pct = percent(entry.get("day_change_pct"))
+    if tone == "muted":
+        change = "--"
+    else:
+        arrow = "↗" if tone == "gain" else "↘"
+        change = f"{arrow} {amount if amount != '--' else pct}"
+        if amount != "--" and pct != "--":
+            change += f" ({pct})"
+    return (
+        '<span class="gic-stock-quote">'
+        f'<span class="gic-stock-last" data-move="{animation}" title="{title}">{price_text(price)}</span>'
+        f'<span class="gic-stock-change gic-{tone}">{change}</span></span>'
+    )
+
+
+def intraday_series(history, tape, entry):
+    candles, interval = history or ((), None)
+    ticks = tape["ticks"] if tape else ()
+    points = list(candles or ticks)
+    appended = False
+    if candles and ticks:
+        latest = ticks[-1]
+        if latest[0] > points[-1][0]:
+            points.append(latest)
+            appended = True
+        elif latest[0] == points[-1][0]:
+            points[-1] = latest
+            appended = True
+
+    label = "5-minute bars" if interval == 5 else "5 days · 15-minute bars" if interval == 15 else "Finnhub quotes"
+    if appended:
+        label += " + Finnhub"
+    label = f"{label} · ET" if points else "Intraday prices · ET"
+    scope = f"{interval}:{points[-1][0].astimezone(ET).date()}" if points else None
+    if len(points) < 2:
+        return {"x": [[], []], "y": [[], []]}, label, scope, False
+
+    times = [at.astimezone(ET).strftime("%Y-%m-%d %H:%M:%S") for at, _ in points]
+    prices = [price for _, price in points]
+    low, high = min(prices), max(prices)
+    floor = max(0, low - max((high - low) * .08, low * .001))
+    tone = quote_direction(entry)
+    loss = tone == "loss" or (tone == "muted" and prices[-1] < prices[0])
+    line, area = ("#FF2A5F", "rgba(255,42,95,.12)") if loss else ("#FFD60A", "rgba(255,214,10,.11)")
+    return ({
+        "x": [[times[0], times[-1]], times], "y": [[floor, floor], prices],
+        "line.color": [None, line], "fillcolor": [None, area],
+    }, label, scope, True)
+
+
+def chart_update(feed, history, selected, symbols, relative, plot_key):
     if feed:
         feed.request([selected], CHART_QUOTE_TTL)
     raw = feed.read([selected, *symbols, "SMH"]) if feed else {}
     entry = raw.get("SMH" if relative else selected) or {}
-    price, pct, stamp = entry.get("price"), entry.get("day_change_pct"), entry.get("time")
-    tape = record_chart_quote(st.session_state.price_history, selected, raw.get(selected))
+    stamp = entry.get("time")
     if relative:
         moves = []
         for symbol in symbols:
             mark = raw.get(symbol) or {}
             observed = mark.get("time")
             if symbol != "SMH" and observed and stamp and observed.date() == stamp.date():
-                excess = difference(mark["day_change_pct"], pct)
+                excess = difference(mark["day_change_pct"], entry["day_change_pct"])
                 if excess is not None:
                     moves.append((excess, symbol))
         moves.sort()
         series = {"x": [[value for value, _ in moves]], "y": [[symbol for _, symbol in moves]],
-                  "marker.color": [["#00FF88" if value >= 0 else "#FF2A5F" for value, _ in moves]]}
+                  "marker.color": [["#FFD60A" if value >= 0 else "#FF2A5F" for value, _ in moves]]}
         has_data = bool(moves)
+        chart_day = stamp.date().isoformat() if stamp else None
+        detail, missing = "Daily return minus SMH · percentage points", "Waiting for comparable stock and SMH quotes"
+        title = "AI sector relative strength"
     else:
-        ticks = tape["ticks"] if tape else ()
-        levels = tape["references"] if tape else ()
-        has_data = bool(ticks) or any(value is not None for value in levels)
-        labels = ["Prev close", "Low", "High", "Last"][:len(levels)]
-        series = {"x": [labels, [ts.strftime("%Y-%m-%d %H:%M:%S") for ts, _ in ticks]],
-                  "y": [list(levels), [value for _, value in ticks]]}
-    missing = "Waiting for a Finnhub quote" if feed else "Enter a Finnhub key in the admin panel"
-    if relative and feed:
-        missing = "Waiting for comparable stock and SMH quotes"
+        candles = history.read(intraday_history, [selected], CHART_HISTORY_TTL)[selected]
+        tape = record_chart_quote(st.session_state.price_history, selected, raw.get(selected))
+        series, detail, chart_day, has_data = intraday_series(candles, tape, entry)
+        missing = "Chart history is unavailable" if history.checked(intraday_history, selected) else "Waiting for chart history"
+        title = f"{escape(selected)} intraday"
     layout = {"xaxis.visible": has_data, "yaxis.visible": has_data, "annotations": [] if has_data else [
         {"xref": "paper", "yref": "paper", "x": .5, "y": .5, "text": missing,
-         "showarrow": False, "font": {"color": "#99a8c2", "size": 11}},
+         "showarrow": False, "font": {"color": "#94A3B8", "size": 12}},
     ]}
-    if not relative:
-        layout["xaxis2.visible"] = has_data
-        layout["xaxis.visible"] = bool(ticks)
-    title = "AI sector relative strength" if relative else f"{escape(selected)} intraday"
-    as_of = stamp.strftime("%b %d · %H:%M:%S ET") if stamp else "--"
-    if not relative and price is None and tape and tape["day"]:
-        as_of = f'-- · recorded {tape["day"]:%b %d}'
-    detail = "SMH" if relative else "SESSION FEED"
     header = (
-        f'<div class="gic-chart-head"><div class="gic-panel-top"><div><h2>{title}</h2>'
-        f'<div class="gic-panel-meta">{detail} · {as_of}</div></div></div>'
-        f'<div class="gic-chart-price" title="Daily change {signed_cash(entry.get("day_change_usd"))}">'
-        f'{price_text(price)} <small class="gic-{value_class(pct)}">{percent(pct)}</small></div></div>'
+        '<div class="gic-chart-head"><div class="gic-panel-top"><div>'
+        f'<h2>{title}</h2><div class="gic-panel-meta">{detail}</div></div></div>'
+        f'{price_stack(entry)}</div>'
     )
-    chart_day = stamp.date() if relative and stamp else tape["day"] if tape else None
-    return {"key": plot_key, "header": header, "series": series, "layout": layout,
-            "day": chart_day.isoformat() if chart_day else None}
+    return {"key": plot_key, "header": header, "series": series, "layout": layout, "day": chart_day}
 
 
 def value_class(value):
@@ -2037,19 +2261,38 @@ def value_class(value):
     return "gain" if value > 0 else "loss"
 
 
-def exchange_ticker_data(feed):
-    if feed:
-        feed.request(EXCHANGE_TICKERS, STRIP_QUOTE_TTL)
-    marks = feed.read(EXCHANGE_TICKERS) if feed else {}
+def benchmark_price(mark):
+    value = mark.get("value")
+    if value is None:
+        return "--"
+    if mark["unit"] == "yield":
+        return f"{value:.2f}%"
+    return price_text(value) if mark["unit"] == "usd" else f"{value:,.2f}"
+
+
+def benchmark_change(mark):
+    move = mark.get("move")
+    if move is None:
+        return "--"
+    if mark["unit"] == "yield":
+        if move == 0:
+            return "0 bps"
+        precision = 2 if abs(move) < 1 else 0
+        return f"{move:+.{precision}f} bps"
+    if move == 0:
+        return "0.00%"
+    return ("▲ " if move > 0 else "▼ ") + percent(move)
+
+
+def exchange_ticker_data(marks):
     rows = {}
     for symbol, name in EXCHANGE_TICKERS.items():
-        quote = marks.get(symbol) or {}
-        move, stamp = quote.get("day_change_pct"), quote.get("time")
-        arrow = "▲ " if move and move > 0 else "▼ " if move and move < 0 else ""
+        mark = marks.get(symbol) or {}
+        stamp = mark.get("as_of_et")
+        detail = f"{symbol} · {datetime.fromisoformat(stamp):%b %d %H:%M ET}" if stamp else f"{symbol} · Reading unavailable"
         rows[symbol] = {
-            "name": name, "price": price_text(quote.get("price")),
-            "move": arrow + (percent(move) if move != 0 else "0.00%"), "direction": value_class(move),
-            "title": f"{symbol} fund quote in USD · {stamp:%b %d %H:%M:%S ET}" if stamp else f"{symbol} · Quote unavailable",
+            "name": name, "price": benchmark_price(mark), "move": benchmark_change(mark),
+            "direction": value_class(mark.get("move")), "title": detail,
         }
     return rows
 
@@ -2092,11 +2335,12 @@ def stock_browser_controls():
         with search_column:
             search = st.text_input(
                 "Search Stock (Ticker or Company Name)", key="gic_stock_search",
-                label_visibility="collapsed", placeholder="Search Stock (Ticker or Company Name)",
+                label_visibility="collapsed", placeholder="Search ticker or company",
             )
         with filters:
             exchange = st.pills(
                 "Exchange", MARKET_FILTERS, default="TOP 20", key="gic_stock_filter",
+                format_func=lambda market: "Top 20" if market == "TOP 20" else market,
                 label_visibility="collapsed",
             ) or "TOP 20"
 
@@ -2133,56 +2377,60 @@ def stock_browser_controls():
     return dict(matches[start:start + STOCK_PAGE_SIZE]), loading
 
 
-def holding_rows(market, stocks, selected, portfolio, loading_directory=False):
-    pnl = {entry["ticker"]: entry["position_pnl"] for entry in portfolio["positions"]}
+def sparkline(closes):
+    if not closes or len(closes) < 2:
+        return '<span class="gic-spark empty" aria-hidden="true"></span>'
+    low, high = min(closes), max(closes)
+    step = 84 / (len(closes) - 1)
+    points = [(2 + index * step, 25 - 22 * (price - low) / (high - low) if high > low else 14)
+              for index, price in enumerate(closes)]
+    first_x, first_y = points[0]
+    path = [f"M {first_x:.2f} {first_y:.2f}"]
+    for (x, y), (next_x, next_y) in zip(points[1:-1], points[2:]):
+        path.append(f"Q {x:.2f} {y:.2f} {(x + next_x) / 2:.2f} {(y + next_y) / 2:.2f}")
+    last_x, last_y = points[-1]
+    path.append(f"L {last_x:.2f} {last_y:.2f}")
+    tone = "gain" if closes[-1] >= closes[0] else "loss"
+    move = percent(change_pct(closes[-1], closes[0]))
+    return (
+        f'<svg class="gic-spark gic-{tone}" viewBox="0 0 88 28" width="88" height="28" role="img" '
+        f'aria-label="Five-day change {move}">'
+        f'<title>Five-day trend · hourly closes · {move}</title>'
+        f'<path d="{" ".join(path)}" fill="none" stroke-width="1.6" stroke-linecap="round"/></svg>'
+    )
+
+
+def holding_rows(market, stocks, selected, history, loading_directory=False):
     previous_prices = st.session_state.prev_prices
     rows = []
     for ticker, company in stocks.items():
         entry = market["quotes"][ticker]
-        session = entry["latest_extended"]
-        change = entry["sessions"].get(session, {}).get("delta_pct")
-        short = {SESSIONS[0]: "PRE", SESSIONS[2]: "AH"}.get(session, "")
-        flags = ["current"] if ticker == selected else []
-        if momentum(change):
-            flags.append("break-up" if change > 0 else "break-down")
-        stamp = entry["time"]
-        as_of = stamp.strftime("%b %d %H:%M:%S ET") if stamp else "--"
-        source = (f"Finnhub · {as_of} · Daily change {signed_cash(entry['day_change_usd'])} "
-                  f"({percent(entry['day_change_pct'])})")
         symbol = escape(ticker, quote=True)
-        name = escape(company)
-        company_title = escape(company, quote=True)
-        gain = pnl.get(ticker)
-        close_title = f'Regular close · {entry["regular_close_date"] or "Finnhub previous close"}'
-        price = entry["price"]
-        displayed = price_text(price)
+        symbol_url = quote(ticker, safe="")
+        name = escape(company, quote=True)
+        monogram = escape(ticker.replace("-", "")[:2])
+        current = entry["price"]
         previous = previous_prices.get(ticker)
-        price_move = ""
-        if price is not None and previous is not None and displayed != price_text(previous):
-            price_move = "gain" if price > previous else "loss"
-        previous_prices[ticker] = price
+        animation = ""
+        if current is not None and previous is not None and price_text(current) != price_text(previous):
+            animation = "gain" if current > previous else "loss"
+        previous_prices[ticker] = current
+
         rows.append(
-            f'<tr class="{" ".join(flags)}" data-ticker="{symbol}">'
-            f'<td><button type="button" class="gic-symbol" data-symbol="{symbol}" title="{company_title}" '
-            f'aria-pressed="{str(ticker == selected).lower()}">{symbol}</button>'
-            f'<span class="gic-name">{name}</span></td>'
-            f'<td title="{source}" data-price-move="{price_move}">{displayed}</td>'
-            f'<td class="gic-reg-close" title="{close_title}">{price_text(entry["regular_close"])}</td>'
-            f'<td class="gic-ext-change {value_class(change)}">{percent(change)}'
-            f'<span class="gic-ext-session">{short}</span></td>'
-            '<td class="muted" title="Volume is unavailable from Finnhub quotes">--</td>'
-            '<td class="muted" title="Anomaly scoring requires volume history">--</td>'
-            f'<td class="{value_class(gain)}">{signed_cash(gain)}</td></tr>'
+            f'<a class="gic-watch-row" data-ticker="{symbol}" href="?select={symbol_url}" target="_self" '
+            f'aria-current="{str(ticker == selected).lower()}">'
+            '<span class="gic-stock-identity">'
+            f'<span class="gic-company-logo" aria-hidden="true">{monogram}'
+            f'<img src="{PARQET_LOGO_URL}/{symbol_url}?format=png" width="36" height="36" alt="" '
+            'loading="lazy" decoding="async" referrerpolicy="no-referrer"></span>'
+            f'<span class="gic-stock-label"><span class="gic-stock-name" title="{name}">{name}</span>'
+            f'<span class="gic-stock-symbol">{symbol}</span></span></span>'
+            f'{sparkline(history.get(ticker))}{price_stack(entry, animation)}</a>'
         )
-    columns = ("Ticker", "Session price", "Reg close", "Ext-hours Δ", "Volume ratio", "Anomaly / 100", "Position P&L")
-    headings = "".join(f'<th scope="col">{label}</th>' for label in columns)
     empty_message = "Loading listings…" if loading_directory else "No stocks match this search."
-    content = "".join(rows) or f'<tr><td colspan="7" class="muted">{empty_message}</td></tr>'
+    content = "".join(rows) or f'<div class="gic-empty" role="status">{empty_message}</div>'
     page_key = escape(",".join(stocks), quote=True)
-    return (
-        f'<div class="gic-table-wrap" data-page="{page_key}"><table class="gic-table" aria-label="Stocks">'
-        f'<thead><tr>{headings}</tr></thead><tbody>{content}</tbody></table></div>'
-    )
+    return f'<div class="gic-watchlist" role="region" aria-label="Watchlist stocks" data-page="{page_key}">{content}</div>'
 
 
 def header_clocks(now):
@@ -2196,70 +2444,68 @@ def header_clocks(now):
     return f'<div class="gic-clocks">{"".join(clocks)}</div>'
 
 
-def header_market_pulse(now, quotes, status):
+def header_market_pulse(now, quotes):
     _, session, _ = market_clock(now)
     readings = "".join(
-        f'<span title="{escape(quotes[symbol]["title"], quote=True)}">{escape(name)} '
-        f'<b>{quotes[symbol]["price"]}</b> <small class="gic-{quotes[symbol]["direction"]}">'
-        f'{quotes[symbol]["move"]}</small></span>' for symbol, name in MACRO_SYMBOLS.items()
+        f'<span class="gic-macro-reading" title="{escape(quotes[symbol]["title"], quote=True)}">{escape(name)}'
+        f'<span class="gic-macro-value"><b>{quotes[symbol]["price"]}</b>'
+        f'<small class="gic-{quotes[symbol]["direction"]}">{quotes[symbol]["move"]}</small></span></span>'
+        for symbol, name in MACRO_SYMBOLS.items()
     )
     return (
         '<div class="gic-market-pulse">'
         f'<span class="gic-session {"closed" if session == "Closed" else ""}">{SESSION_LABELS[session]}</span>'
-        f'<div class="gic-macro" aria-label="Benchmark fund quotes">{readings}</div>'
-        f'<span class="gic-tag {"gic-connected" if status == "FINNHUB LIVE" else "gic-waiting"}">{status}</span></div>'
+        f'<div class="gic-macro" aria-label="Market benchmarks">{readings}</div></div>'
     )
 
 
-def portfolio_strip(portfolio):
+def portfolio_strip(portfolio, off_page_positions):
     values = portfolio["totals"]
     cards = [
-        ("MARKED VALUE", price_text(values["value"]), "muted"),
-        ("DAY P&L", signed_cash(values["day_pnl"]), value_class(values["day_pnl"])),
-        ("UNREALIZED P&L", signed_cash(values["position_pnl"]), value_class(values["position_pnl"])),
+        ("Marked value", price_text(values["value"]), "muted"),
+        ("Day P&L", signed_cash(values["day_pnl"]), value_class(values["day_pnl"])),
+        ("Unrealized P&L", signed_cash(values["position_pnl"]), value_class(values["position_pnl"])),
     ]
-    return '<div class="gic-portfolio-strip">' + "".join(
-        f'<div><span>{name}</span><strong class="gic-{tone}">{amount}</strong></div>'
-        for name, amount, tone in cards
-    ) + "</div>"
+    coverage = f'{portfolio["priced_positions"]}/{len(portfolio["positions"])} positions priced'
+    if off_page_positions:
+        coverage += " · Includes last available quotes for off-page positions"
+    return f'<dl class="gic-portfolio-strip" title="{coverage}">' + "".join(
+        f'<div><dt>{name}</dt><dd class="gic-{tone}">{amount}</dd></div>' for name, amount, tone in cards
+    ) + "</dl>"
 
 
-def market_view(market, stocks, positions, selected, holding_picker, loading_directory=False):
-    st.html(
-        '<div class="gic-panel-top"><div><h2>Stock tracker</h2>'
-        f'<div class="gic-panel-meta">{len(stocks)} SYMBOLS · {market["day"]:%b %d, %Y} ET</div></div></div>'
-    )
+def market_view(market, stocks, positions, selected, feed, history, holding_picker, loading_directory):
     portfolio = evaluate_portfolio(positions, market)
-    st.html(portfolio_strip(portfolio))
+    st.html(portfolio_strip(portfolio, market["off_page_positions"]))
+    trends = history.read(hourly_history, stocks, HOURLY_HISTORY_TTL)
     result = holding_picker(
-        data=holding_rows(market, stocks, selected, portfolio, loading_directory), key="gic_holding_picker",
-        on_ticker_change=lambda: None, isolate_styles=False,
+        data=holding_rows(market, stocks, selected, trends, loading_directory), key="gic_holding_picker",
+        on_select_change=lambda: None, isolate_styles=False,
     )
-    state = st.session_state
-    if result.ticker in stocks and (
-        result.ticker != selected or state.get("gic_relative") or result.ticker not in positions
-    ):
-        state.gic_chart_pick = result.ticker
+    picked = result.select
+    if isinstance(picked, str) and picked in stocks and (picked != selected or st.session_state.get("gic_relative")):
+        # Carry the link through the existing WebSocket, then consume the parameter on the full rerun.
+        st.query_params["select"] = picked
         st.rerun(scope="app")
-    visible = (market["quotes"][ticker] for ticker in stocks)
-    moves = [entry["sessions"].get(entry["latest_extended"], {}).get("delta_pct") for entry in visible]
-    breakout = sum(momentum(move) for move in moves) if any(move is not None for move in moves) else "--"
-    caption = "Off-page positions use last seen marks." if market["off_page_positions"] else "Position P&L uses entry cost."
-    st.html(
-        f'<div class="gic-rule-strip"><span><b>{breakout}</b> extended moves beyond ±3%</span>'
-        f'<span><b>{portfolio["priced_positions"]}/{len(portfolio["positions"])}</b> marked positions</span></div>'
-        f'<div class="gic-panel-meta">Finnhub quotes exclude volume. {caption}</div>'
-    )
+
+    status = feed.status((*stocks, selected)) if feed else None
+    notes = {
+        None: "Add a Finnhub key in the sidebar to show live stock prices.",
+        "CHECK FINNHUB KEY": "Check the Finnhub API key in the sidebar.",
+        "FINNHUB UNAVAILABLE": "Finnhub quotes are temporarily unavailable.",
+        "FINNHUB ACCESS DENIED": "Finnhub denied access to quotes.",
+        "FINNHUB RATE LIMITED": "Waiting for Finnhub’s rate limit to reset.",
+        "FINNHUB · NO QUOTE": "Finnhub has no quote for the current selection.",
+    }
+    if note := notes.get(status):
+        st.html(f'<div class="gic-panel-meta">{note}</div>')
 
 
 def render_message(entry):
     with st.chat_message(entry["role"]):
         if entry.get("tools"):
-            badges = "".join(f'<span class="gic-tool">{escape(TOOL_LABELS[name])}</span>' for name in entry["tools"])
-            st.html(
-                f'<div class="gic-badges"><span class="gic-engine">⚡ Checked</span>{badges}'
-                f'<span class="gic-engine">{escape(entry["engine"])}</span></div>'
-            )
+            checked = " · ".join(TOOL_LABELS[name] for name in entry["tools"])
+            st.html(f'<div class="gic-tool-line">Checked {escape(checked)} · {escape(entry["engine"])}</div>')
         st.markdown(entry["text"])
 
 
@@ -2477,7 +2723,6 @@ def main():
     st.set_page_config(page_title="GIC Holdings Tracker", page_icon="◈",
                        layout="wide", initial_sidebar_state="collapsed")
     st.html(TERMINAL_CSS)
-    st.html(STOCK_BROWSER_CSS)
     state = st.session_state
     state.setdefault("finance_memory", empty_finance_memory())
     if "finnhub_chat_history" not in state:
@@ -2492,8 +2737,8 @@ def main():
     state.setdefault("copilot_queue", [])
     state.setdefault("positions", default_positions())
     state.setdefault("selected_ticker", "NVDA")
-    picked = state.pop("gic_chart_pick", None)
-    if picked:
+    picked = normalize_stock_ticker(st.query_params.pop("select", "") or "")
+    if len(picked) <= 22 and TICKER_PATTERN.fullmatch(picked):
         ensure_position(picked)
         state.selected_ticker = picked
         state.gic_relative = False
@@ -2508,15 +2753,15 @@ def main():
         "gic_exchange_ticker", html=EXCHANGE_TICKER_HTML, css=EXCHANGE_TICKER_CSS, js=EXCHANGE_TICKER_JS,
     )
     with st.container(key="gic_command"):
-        brand, pulse = st.columns([2.25, 7.75], vertical_alignment="center")
+        brand, pulse = st.columns([2.4, 7.6], vertical_alignment="center")
         with brand:
             st.html(
                 '<div class="gic-brand"><span class="gic-logo" aria-hidden="true">◈</span>'
-                '<div><h1 class="gic-title">GIC HOLDINGS TRACKER</h1>'
-                '</div></div>'
+                '<h1 class="gic-title">GIC Holdings Tracker</h1></div>'
             )
     holdings, right = st.columns([56, 44])
     with holdings, st.container(key="gic_holdings"):
+        st.html('<div class="gic-panel-top"><h2>Watchlist</h2></div>')
         stocks, loading_directory = stock_browser_controls()
         stock_list = st.container()
     positions = state.positions
@@ -2529,6 +2774,9 @@ def main():
         state.prev_prices = {}
         state.market_credential = credential_id
     feed = finnhub_feed(credential_id, finnhub_key) if finnhub_key else None
+    history = history_feed()
+    if not state.get("gic_relative"):
+        history.read(intraday_history, [state.selected_ticker], CHART_HISTORY_TTL)
 
     @st.fragment(run_every="1s")
     def render_clocks():
@@ -2536,10 +2784,12 @@ def main():
 
     @st.fragment(run_every="5s")
     def render_market_pulse():
-        quotes = exchange_ticker_data(feed)
+        ordered_symbols = dict.fromkeys([*MACRO_SYMBOLS, *EXCHANGE_TICKERS])
+        marks = history.read(benchmark_history, ordered_symbols, BENCHMARK_TTL)
+        state.gic_benchmark_marks = marks
+        quotes = exchange_ticker_data(marks)
         state.gic_exchange_strip_quotes = list(quotes.values())
-        status = feed.status((*stocks, state.selected_ticker, *EXCHANGE_TICKERS)) if feed else "ADMIN LOCKED · ENTER KEY"
-        markup = header_market_pulse(datetime.now(ET), quotes, status)
+        markup = header_market_pulse(datetime.now(ET), quotes)
         market_pulse(data={"markup": markup, "quotes": state.gic_exchange_strip_quotes}, key="gic_market_pulse",
                      isolate_styles=False, width="content")
 
@@ -2549,11 +2799,11 @@ def main():
         if loading_directory and future is not None and future.done():
             st.rerun(scope="app")
         market = market_snapshot(feed, stocks, state.selected_ticker, positions)
-        market_view(market, stocks, positions, state.selected_ticker, holding_picker, loading_directory)
+        market_view(market, stocks, positions, state.selected_ticker, feed, history, holding_picker, loading_directory)
 
     @st.fragment(run_every="3s")
     def render_chart_tick(selected_ticker, relative, plot_key):
-        chart_tick(data=chart_update(feed, selected_ticker, stocks, relative, plot_key),
+        chart_tick(data=chart_update(feed, history, selected_ticker, stocks, relative, plot_key),
                    key="gic_chart_readout", isolate_styles=False)
 
     @st.fragment(run_every="2s")
@@ -2561,7 +2811,7 @@ def main():
         status = update_copilot(positions, active_model_key, feed)
         labels = {
             "local": "Local quant", "checking": "Connecting to OpenAI…",
-            "unavailable": "OpenAI unavailable · Local quant", "connected": "OPENAI QUANT AGENT ACTIVE",
+            "unavailable": "OpenAI unavailable · Local quant", "connected": "OpenAI quant agent active",
         }
         label_css = "gic-agent-active" if status == "connected" else ""
         learned = sum(len(entries) for entries in state.finance_memory.values())
@@ -2615,12 +2865,12 @@ def main():
         if submitted:
             ask_copilot(typed)
 
-    with stock_list:
-        render_holdings()
     with pulse, st.container(key="gic_header_pulse", horizontal=True, horizontal_alignment="right",
                              vertical_alignment="center", gap=None):
         render_clocks()
         render_market_pulse()
+    with stock_list:
+        render_holdings()
     with right:
         with st.container(key="gic_chart"):
             selected_ticker = state.selected_ticker
@@ -2633,9 +2883,6 @@ def main():
             with st.container(key="gic_plot_frame"):
                 st.plotly_chart(chart_figure(selected_ticker, relative), key=plot_key, theme=None,
                                 height="stretch", config={"displayModeBar": False, "staticPlot": False})
-            legend = ("Daily return minus SMH · percentage points" if relative else
-                      "Prev close / low / high · Finnhub quote ticks in ET")
-            st.html(f'<div class="gic-legend">{legend}</div>')
         with st.container(key="gic_copilot"):
             render_copilot_header()
             render_quick_actions()
