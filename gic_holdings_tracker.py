@@ -34,24 +34,24 @@ UK = pytz.timezone("Europe/London")
 KST = pytz.timezone("Asia/Seoul")
 NYSE = calendars.get_calendar("XNYS")
 MACRO_SYMBOLS = ("^TNX", "^VIX", "DX-Y.NYB", "QQQ")
-# Instrument name and illustrative price/change for Live Sim.
+# Instrument name and illustrative price/daily move for Live Sim (^TNX in bps).
 EXCHANGE_TICKERS = {
-    "SPY": ("S&P 500", 638.42, .64),
-    "QQQ": ("NASDAQ-100", 563.13, .93),
-    "DIA": ("DOW JONES", 434.85, .22),
-    "IWM": ("RUSSELL 2000", 224.76, -.31),
+    "^GSPC": ("S&P 500", 6384.20, .64),
+    "^NDX": ("NASDAQ-100", 23124.36, .93),
+    "^DJI": ("DOW JONES", 43485.16, .22),
+    "^RUT": ("RUSSELL 2000", 2247.60, -.31),
     "SMH": ("VANECK SEMICONDUCTOR", 290.31, 1.28),
     "SOXX": ("ISHARES SEMICONDUCTOR", 253.60, 1.13),
     "XLK": ("TECHNOLOGY SELECT SECTOR", 256.18, .76),
     "^VIX": ("VIX", 16.47, -2.08),
-    "^TNX": ("US 10-YEAR TREASURY YIELD", 4.29, -.47),
+    "^TNX": ("US 10-YEAR TREASURY YIELD", 4.19, -4),
     "IEF": ("US 10-YEAR TREASURY BOND", 94.72, -.28),
     "^FTSE": ("FTSE 100", 8914.75, .37),
     "^KS11": ("KOSPI", 3188.41, -.21),
     "^KQ11": ("KOSDAQ", 805.42, .51),
     "GLD": ("GOLD", 306.84, .52),
 }
-EXCHANGE_TICKER_TTL = 15
+EXCHANGE_TICKER_TTL = 30
 WATCHLIST = {
     "NVDA": ("NVIDIA", 180, 20, 142.50), "MSFT": ("Microsoft", 485, 10, 390),
     "GOOGL": ("Alphabet", 205, 15, 169), "META": ("Meta Platforms", 640, 6, 535),
@@ -69,7 +69,8 @@ SESSION_FEED = "Session feed"
 NEWS_FEED = "News feed"
 MODEL = "gpt-4o-mini"
 TIMEOUT = 5
-MARKET_REFRESH_SECONDS = 10
+MARKET_REFRESH_SECONDS = 5
+CHART_SESSIONS = 5
 YAHOO_REQUEST_INTERVAL = 0.4
 SIP_DELAY = timedelta(minutes=15, seconds=10)
 MAX_POSITIONS = 24
@@ -466,6 +467,20 @@ def percent(value):
     return "—" if value is None else f"{value:+.2f}%"
 
 
+def treasury_yield(value):
+    value = number(value)
+    return value / 10 if value is not None and value > 20 else value
+
+
+def bps_text(value):
+    value = number(value)
+    if value is None:
+        return "—"
+    if value == 0:
+        return "0 bps"
+    return f"{value:+.1f} bps" if abs(value) < 1 else f"{value:+.0f} bps"
+
+
 def price_text(value):
     value = number(value)
     return "—" if value is None else f"${value:,.2f}"
@@ -501,6 +516,13 @@ def momentum(change):
 
 def default_positions():
     return {ticker: {"shares": item[2], "cost_basis": item[3]} for ticker, item in WATCHLIST.items()}
+
+
+def ensure_position(ticker):
+    state = st.session_state
+    if ticker not in state.positions:
+        # Co-Pilot jobs can still hold the previous positions dictionary.
+        state.positions = {**state.positions, ticker: {"shares": 0., "cost_basis": 0.}}
 
 
 def empty_frame():
@@ -611,8 +633,18 @@ def download_yahoo(symbols, period, interval, intraday):
         return {}
 
 
-@st.cache_data(ttl=10, max_entries=12, show_spinner=False)
+@st.cache_data(ttl=MARKET_REFRESH_SECONDS, max_entries=12, show_spinner=False)
 def yahoo_market(symbols):
+    return download_yahoo(symbols, "5d", "1m", True)
+
+
+@st.cache_data(ttl=MARKET_REFRESH_SECONDS, max_entries=24, show_spinner=False)
+def yahoo_chart_history(ticker):
+    return download_yahoo((ticker,), f"{CHART_SESSIONS}d", "15m", True)
+
+
+@st.cache_data(ttl=EXCHANGE_TICKER_TTL, max_entries=4, show_spinner=False)
+def yahoo_macro_minutes(symbols):
     return download_yahoo(symbols, "5d", "1m", True)
 
 
@@ -622,35 +654,48 @@ def yahoo_history(symbols):
 
 
 @st.cache_data(ttl=EXCHANGE_TICKER_TTL, show_spinner=False)
-def load_exchange_ticker():
-    """Read each instrument's latest regular-session mark and prior close."""
+def load_exchange_ticker(symbols):
+    """Use the two latest valid daily closes in each instrument's exchange timezone."""
     session = yahoo_session()
     quotes = {}
-    for symbol in EXCHANGE_TICKERS:
+    for symbol in symbols:
         if session.cooldown.active():
             break
-        try:
-            # Individual histories avoid the shared state in yf.download.
-            history = yf.Ticker(symbol, session=session).history(
-                period="5d", interval="1d", auto_adjust=False, timeout=TIMEOUT, raise_errors=True,
-            )
-            closes = normalize_frame(history, intraday=False)["c"]
+        candidates = (symbol, "^KOSDAQ") if symbol == "^KQ11" else (symbol,)
+        for candidate in candidates:
+            try:
+                # Individual histories avoid the shared state in yf.download.
+                history = yf.Ticker(candidate, session=session).history(
+                    period="5d", interval="1d", auto_adjust=False, timeout=TIMEOUT, raise_errors=True,
+                )
+                closes = normalize_frame(history, intraday=False)["c"].tail(2)
+            except (YFRateLimitError, curl_requests.exceptions.ConnectionError):
+                return quotes
+            except Exception:
+                continue
             if closes.empty:
                 continue
             price = number(closes.iloc[-1])
-            previous = closes.iloc[-2] if len(closes) > 1 else None
-            quotes[symbol] = (price, change_pct(price, previous), closes.index[-1].date().isoformat())
-        except (YFRateLimitError, curl_requests.exceptions.ConnectionError):
-            break
-        except Exception:
-            continue
+            previous = closes.iloc[0] if len(closes) == 2 else None
+            if symbol == "^TNX":
+                price = treasury_yield(price)
+                move = scale(difference(price, treasury_yield(previous)), 100)
+            else:
+                move = change_pct(price, previous)
+            day = closes.index[-1].date().isoformat()
+            saved = quotes.get(symbol)
+            if saved is None or day > saved[2] or (day == saved[2] and move is not None):
+                quotes[symbol] = (price, move, day)
+            if len(closes) == 2:
+                break
     return quotes
 
 
 class ExchangeTickerFeed:
     """Refresh the same ticker strip for all viewers without blocking the UI."""
 
-    def __init__(self):
+    def __init__(self, symbols):
+        self._symbols = symbols
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gic-exchange-ticker")
         self._lock = Lock()
         self._pending = None
@@ -665,18 +710,21 @@ class ExchangeTickerFeed:
                     updated = self._pending.result()
                 except Exception:
                     updated = {}
+                # A late response with an older trading date cannot replace a newer quote.
+                updated = {symbol: quote for symbol, quote in updated.items()
+                           if symbol not in self._quotes or quote[2] >= self._quotes[symbol][2]}
                 self._quotes.update(updated)
                 self._fresh = frozenset(updated)
                 self._pending = None
                 self._refresh_at = monotonic() + EXCHANGE_TICKER_TTL
             if self._pending is None and monotonic() >= self._refresh_at:
-                self._pending = self._executor.submit(load_exchange_ticker)
+                self._pending = self._executor.submit(load_exchange_ticker, self._symbols)
             return self._quotes.copy(), self._fresh
 
 
 @st.cache_resource(show_spinner=False)
-def exchange_ticker_feed():
-    return ExchangeTickerFeed()
+def exchange_ticker_feed(symbols):
+    return ExchangeTickerFeed(symbols)
 
 
 @st.cache_resource(show_spinner=False)
@@ -727,7 +775,7 @@ def alpaca_frames(symbols, start, end, feed, auth, timeframe):
                 continue
             frame = pd.DataFrame(rows)
             frame.index = pd.to_datetime(frame["t"], utc=True).dt.tz_convert(ET)
-            normalized = normalize_frame(frame.rename(columns={"c": "Close", "v": "Volume"}), timeframe == "1Min")
+            normalized = normalize_frame(frame.rename(columns={"c": "Close", "v": "Volume"}), timeframe != "1Day")
             if not normalized.empty:
                 frames[symbol] = normalized
         return frames
@@ -735,9 +783,9 @@ def alpaca_frames(symbols, start, end, feed, auth, timeframe):
         return {}
 
 
-@st.cache_data(ttl=10, max_entries=16, show_spinner=False)
-def alpaca_market(symbols, start, end, feed, auth):
-    return alpaca_frames(symbols, start, end, feed, auth, "1Min")
+@st.cache_data(ttl=MARKET_REFRESH_SECONDS, max_entries=16, show_spinner=False)
+def alpaca_market(symbols, start, end, feed, auth, timeframe="1Min"):
+    return alpaca_frames(symbols, start, end, feed, auth, timeframe)
 
 
 @st.cache_data(ttl=900, max_entries=16, show_spinner=False)
@@ -745,30 +793,46 @@ def alpaca_history(symbols, end, feed, auth):
     return alpaca_frames(symbols, end - timedelta(days=55), end, feed, auth, "1Day")
 
 
-def load_market_feeds(symbols, auth, feed, now):
+def load_market_feeds(symbols, chart_ticker, auth, feed, now):
     """Run the live market batch and independently cached daily baselines off the UI thread."""
     day, _, bounds = market_clock(now)
     previous = session_bounds(NYSE.previous_session(str(day)).date())
     alpaca = {}
     cutoff = now - SIP_DELAY if feed == "sip" else now
+    bucket_end = cutoff.replace(second=cutoff.second // MARKET_REFRESH_SECONDS * MARKET_REFRESH_SECONDS, microsecond=0)
+    coverage_end = min(bounds[-1], bucket_end)
     if auth:
-        bucket_end = cutoff.replace(second=cutoff.second // 10 * 10, microsecond=0)
-        equities = tuple(symbol for symbol in symbols if symbol not in MACRO_SYMBOLS)
-        alpaca = alpaca_market(equities, previous[1], min(bounds[-1], bucket_end), feed, auth)
-    missing = tuple(symbol for symbol in symbols if symbol not in alpaca and symbol not in MACRO_SYMBOLS)
+        equities = tuple(symbol for symbol in symbols if TICKER_PATTERN.fullmatch(symbol))
+        alpaca = alpaca_market(equities, previous[1], coverage_end, feed, auth)
+    missing = tuple(symbol for symbol in symbols if symbol not in alpaca)
     yahoo = yahoo_market(missing) if missing else {}
-    # Reuse the same macro cache for every page without adding benchmarks to the stock batch.
-    macro = yahoo_market(MACRO_SYMBOLS)
+    # Benchmarks outside the visible page have their own cache and request batch.
+    macro_only = tuple(symbol for symbol in MACRO_SYMBOLS if symbol not in symbols)
+    macro = yahoo_macro_minutes(macro_only)
+    bars = {**macro, **yahoo, **alpaca}
+    chart_history = {}
+    if chart_ticker and not has_today_bars(bars.get(chart_ticker), bounds, now):
+        older = {}
+        chart_source = SESSION_FEED
+        if auth:
+            # Include the prior five sessions even when today has no bars.
+            start = session_bounds(NYSE.sessions_window(str(day), -(CHART_SESSIONS + 1))[0].date())[0]
+            older = alpaca_market((chart_ticker,), start, coverage_end, feed, auth, "15Min")
+            if older:
+                chart_source = FEED_LABELS[feed]
+        if not older:
+            older = yahoo_chart_history(chart_ticker)
+        chart_history = {ticker: (frame, chart_source) for ticker, frame in older.items()}
     history = yahoo_history(missing) if yahoo else {}
-    macro_history = yahoo_history(MACRO_SYMBOLS) if macro else {}
+    macro_history = yahoo_history(macro_only) if macro else {}
     alpaca_daily = alpaca_history(tuple(alpaca), previous[-1], feed, auth) if alpaca else {}
     coverage = dict.fromkeys(yahoo, now)
     if alpaca:
-        coverage.update(dict.fromkeys(alpaca, min(bounds[-1], bucket_end)))
+        coverage.update(dict.fromkeys(alpaca, coverage_end))
     return {
-        "bars": {**macro, **yahoo, **alpaca}, "history": {**macro_history, **history, **alpaca_daily},
+        "bars": bars, "history": {**macro_history, **history, **alpaca_daily},
         "sources": {**dict.fromkeys(macro | yahoo, SESSION_FEED), **dict.fromkeys(alpaca, FEED_LABELS[feed])},
-        "coverage": coverage,
+        "coverage": coverage, "chart_history": chart_history,
     }
 
 
@@ -820,6 +884,44 @@ def historical_volumes(frame, day):
 
 def segment(frame, start, end, now):
     return frame.loc[(frame.index >= start) & (frame.index < end) & (frame.index <= now)]
+
+
+def has_today_bars(frame, bounds, now):
+    return (frame is not None and bounds[0].date() == now.date()
+            and not segment(frame, bounds[0], bounds[-1], now).empty)
+
+
+@st.cache_data(max_entries=48, show_spinner=False)
+def simulated_chart_history(ticker, day):
+    frames = []
+    for date in NYSE.sessions_window(str(day), -CHART_SESSIONS):
+        bounds = session_bounds(date.date())
+        prior = session_bounds(NYSE.previous_session(date).date())
+        frame, _ = simulated_series(ticker, bounds, prior, bounds[-1], False, False)
+        frames.append(frame.loc[frame.index >= bounds[0], ["c"]])
+    return pd.concat(frames)
+
+
+def recent_chart_bars(frame, now):
+    bars = frame.loc[frame.index <= now, ["c"]].resample("15min").last().dropna()
+    dates = bars.index.normalize()
+    return bars.loc[dates.isin(dates.unique()[-CHART_SESSIONS:])]
+
+
+def chart_backfill(ticker, day, now, feeds):
+    """Prefer provider 15-minute bars, then recent observations, then labeled simulation."""
+    recent = (feeds["bars"].get(ticker), feeds["sources"].get(ticker, SESSION_FEED))
+    primary = feeds.get("chart_history", {}).get(ticker)
+    for record in (primary, recent):
+        if record is None:
+            continue
+        frame, source = record
+        if frame is not None and not frame.empty:
+            bars = recent_chart_bars(frame, now)
+            if not bars.empty:
+                return bars, source
+    demo = simulated_chart_history(ticker, day)
+    return recent_chart_bars(demo, now), SIMULATED
 
 
 def last_price(frame):
@@ -943,6 +1045,7 @@ def macro_snapshot(feeds, day, now, ticking):
     else:
         source = SESSION_FEED
 
+    series["^TNX"] = series["^TNX"].map(treasury_yield)
     readings = {
         symbol: {"value": number(values.iloc[-1]), "previous": number(values.iloc[-2]),
                  "date": str(values.index[-1].date())}
@@ -971,7 +1074,7 @@ def macro_snapshot(feeds, day, now, ticking):
     }
 
 
-def build_snapshot(now, symbols, live_sim, feeds=None):
+def build_snapshot(now, symbols, chart_ticker, live_sim, feeds=None):
     day, session, bounds = market_clock(now)
     prior = session_bounds(NYSE.previous_session(str(day)).date())
     feeds = feeds or {"bars": {}, "history": {}, "sources": {}, "coverage": {}}
@@ -987,17 +1090,25 @@ def build_snapshot(now, symbols, live_sim, feeds=None):
             frame, history = simulated_series(ticker, bounds, prior, now, live_sim, session != "Closed")
             coverage = now
         quotes[ticker] = quote_summary(frame, history, source, bounds, prior, now, coverage)
+    fallback = None
+    if chart_ticker and not has_today_bars(feeds["bars"].get(chart_ticker), bounds, now):
+        demo_has_today = live_sim and day == now.date() and any(
+            not frame.empty for frame in quotes[chart_ticker]["segments"]
+        )
+        if not demo_has_today:
+            fallback = chart_backfill(chart_ticker, day, now, feeds)
     return {
         "day": day, "session": session, "bounds": bounds, "quotes": quotes,
         "history": {ticker: frame for ticker, frame in feeds["history"].items()
                     if ticker in quotes or ticker in MACRO_SYMBOLS},
-        "anomalies": detect_anomalies(quotes), "as_of": now, "live_sim": live_sim,
+        "anomalies": detect_anomalies(quotes), "as_of": now, "live_sim": live_sim, "chart_backfill": fallback,
         "macro": macro_snapshot(feeds, day, now, live_sim or session != "Closed"),
     }
 
 
 def retain_off_page_positions(market, previous, positions):
-    retained = {ticker for ticker in positions if ticker in previous["quotes"] and ticker not in market["quotes"]}
+    retained = {ticker for ticker, position in positions.items() if position["shares"]
+                and ticker in previous["quotes"] and ticker not in market["quotes"]}
     for ticker in retained:
         market["quotes"][ticker] = previous["quotes"][ticker]
         if ticker in previous["history"]:
@@ -1006,27 +1117,30 @@ def retain_off_page_positions(market, previous, positions):
     return retained
 
 
-def retain_page_feeds(previous, incoming, symbols):
+def retain_page_feeds(previous, incoming, symbols, chart_ticker):
     requested = set(symbols) | set(MACRO_SYMBOLS)
     missing = requested - incoming["bars"].keys()
     # Carry a symbol's previous bars and their metadata together on a partial failure.
-    return {
+    retained = {
         field: {
             **{ticker: data for ticker, data in previous.get(field, {}).items() if ticker in missing},
             **{ticker: data for ticker, data in values.items() if ticker in requested},
         }
-        for field, values in incoming.items()
+        for field, values in incoming.items() if field != "chart_history"
     }
+    backfill = previous.get("chart_history", {}) | incoming.get("chart_history", {})
+    retained["chart_history"] = {chart_ticker: backfill[chart_ticker]} if chart_ticker in backfill else {}
+    return retained
 
 
-def market_snapshot(symbols, live_sim, auth, feed):
+def market_snapshot(symbols, chart_ticker, live_sim, auth, feed):
     """Apply completed feed jobs and tick simulated marks without blocking the UI."""
     now = datetime.now(ET).replace(microsecond=0)
     day, session, _ = market_clock(now)
-    identity = (symbols, live_sim, feed, day)
+    identity = (symbols, chart_ticker, live_sim, feed, day)
     state = st.session_state
     saved = state.get("provider_data")
-    feeds = saved[1] if saved and saved[0][1:] == identity[1:] and not live_sim else None
+    feeds = saved[1] if saved and saved[0][2:4] == identity[2:4] and not live_sim else None
     pending = state.get("market_pending")
     updated = False
     if pending and pending[0] != identity and pending[1].cancel():
@@ -1037,8 +1151,8 @@ def market_snapshot(symbols, live_sim, auth, feed):
             result = future.result()
         except Exception:
             result = None
-        if pending_id[1:] == identity[1:] and result and result["bars"]:
-            feeds = retain_page_feeds(feeds or {}, result, symbols)
+        if pending_id[2:] == identity[2:] and result and (result["bars"] or result.get("chart_history")):
+            feeds = retain_page_feeds(feeds or {}, result, symbols, chart_ticker)
             state["provider_data"] = (identity, feeds)
             updated = True
 
@@ -1047,7 +1161,7 @@ def market_snapshot(symbols, live_sim, auth, feed):
     # Changing pages never increases the request cadence.
     due = not requested or timestamp - requested[1] >= MARKET_REFRESH_SECONDS
     if not live_sim and not state.get("market_pending") and due:
-        future = feed_executor().submit(load_market_feeds, symbols, auth, feed, now)
+        future = feed_executor().submit(load_market_feeds, symbols, chart_ticker, auth, feed, now)
         state["market_pending"] = (identity, future)
         state["market_requested"] = (identity, timestamp)
 
@@ -1057,15 +1171,15 @@ def market_snapshot(symbols, live_sim, auth, feed):
     current = state.get("market_snapshot")
     refresh = (
         not current or current["identity"] != identity or updated or current["session"] != session
-        or (current["ticks"] and current["as_of"] != now)
+        or (current["ticks"] and (now - current["as_of"]).total_seconds() >= MARKET_REFRESH_SECONDS)
     )
     if refresh:
         previous = current
-        current = build_snapshot(now, symbols, live_sim, feeds)
+        current = build_snapshot(now, symbols, chart_ticker, live_sim, feeds)
         simulated = current["macro"]["source"] == SIMULATED or any(
             entry["source"] == SIMULATED for entry in current["quotes"].values()
         )
-        if previous and previous["identity"][1:] == identity[1:]:
+        if previous and previous["identity"][2:] == identity[2:]:
             current["off_page_positions"] = retain_off_page_positions(current, previous, state.get("positions", {}))
         current.update({"identity": identity, "ticks": simulated and (live_sim or session != "Closed")})
         state["market_snapshot"] = current
@@ -1981,7 +2095,8 @@ TERMINAL_CSS = """
 html, body, [data-testid="stAppViewContainer"] { height: 100vh; overflow: hidden; background: var(--page); }
 .stApp, .stMain { background: var(--page); color: var(--bright); overflow: hidden; }
 .stApp { font-family: var(--font); font-variant-numeric: tabular-nums; }
-[data-testid="stStatusWidget"], .stApp [data-stale="true"] { opacity: 1 !important; transition: none !important; }
+[data-testid="stStatusWidget"] { display: none !important; }
+.stApp [data-stale="true"] { opacity: 1 !important; transition: none !important; }
 .stMainBlockContainer { max-width: 1840px; padding: 12px 23px 0; }
 .stMainBlockContainer [data-testid="stVerticalBlock"] { gap: 10px; }
 .stMainBlockContainer [data-testid="stHorizontalBlock"] { gap: 12px; align-items: start; }
@@ -2010,7 +2125,11 @@ footer, #MainMenu, [data-testid="stDecoration"], [data-testid="stToolbarActions"
 .gic-dot { display: inline-block; width: 6px; height: 6px; margin-right: 6px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); animation: gic-pulse 2.8s ease-in-out infinite; }
 @keyframes gic-pulse { 50% { opacity: .45; } }
 @media (prefers-reduced-motion: reduce) { .gic-dot { animation: none; } }
-.gic-pulse { display: flex; align-items: center; justify-content: flex-end; gap: clamp(5px,1vw,19px); white-space: nowrap; }
+.stMainBlockContainer .st-key-gic_header_pulse, .gic-market-pulse {
+  display: flex; align-items: center; justify-content: flex-end; gap: clamp(5px,1vw,19px);
+  flex-wrap: nowrap; white-space: nowrap;
+}
+.st-key-gic_header_pulse > [data-testid="stLayoutWrapper"] { flex: 0 0 auto; width: max-content; }
 .gic-clocks { display: flex; align-items: center; gap: 9px; }
 .gic-clocks .gic-clock + .gic-clock { border-left: 1px solid #30415b; padding-left: 9px; }
 .gic-clock { color: var(--muted); font: 650 11px var(--font); }
@@ -2024,6 +2143,7 @@ footer, #MainMenu, [data-testid="stDecoration"], [data-testid="stToolbarActions"
 .gic-macro { display: flex; align-items: baseline; gap: clamp(6px,.9vw,17px); border-left: 1px solid #30415b; padding-left: 10px; }
 .gic-macro b { color: var(--bright); font-weight: 700; }
 .gic-macro span { color: var(--muted); font: 10px var(--font); }
+.gic-macro small { font: inherit; }
 .gic-macro .gic-macro-sim, .gic-sim { color: #ffbf69; }
 .st-key-gic_holdings, .st-key-gic_chart, .st-key-gic_copilot {
   padding: 12px; background: var(--panel); border: 1px solid var(--line);
@@ -2141,7 +2261,7 @@ footer, #MainMenu, [data-testid="stDecoration"], [data-testid="stToolbarActions"
 .gic-keys { color: var(--muted); font: 11px/1.65 var(--font); }
 @media (max-width: 1430px) { .gic-name { display: none; } }
 @media (max-width: 1180px) {
-  .gic-pulse, .gic-macro, .gic-clocks { gap: 5px; }
+  .stMainBlockContainer .st-key-gic_header_pulse, .gic-market-pulse, .gic-macro, .gic-clocks { gap: 5px; }
   .gic-clocks .gic-clock + .gic-clock { padding-left: 5px; }
   .gic-ext-session { display: none; }
 }
@@ -2191,18 +2311,18 @@ EXCHANGE_TICKER_CSS = """
   position: fixed; bottom: 0; left: 0; width: 100%; z-index: 9999;
   box-sizing: border-box; height: 40px; background: #030407; border-top: 1px solid #151D2E;
   display: flex; align-items: center; overflow: hidden; white-space: nowrap;
-  font: 700 14px/1 var(--font); font-variant-numeric: tabular-nums; letter-spacing: 0.4px;
+  font: 700 14.5px/1 var(--font); font-variant-numeric: tabular-nums; letter-spacing: 0.4px;
 }
 .gic-exchange-track {
   display: flex; flex: none; width: max-content;
-  animation: tickerScroll 55s linear infinite;
+  animation: tickerScroll 100s linear infinite;
 }
 .gic-exchange-strip:is(:hover, :focus-within) .gic-exchange-track { animation-play-state: paused; }
 .gic-exchange-lane { display: flex; flex: none; min-width: 100vw; justify-content: space-between; }
 .gic-exchange-quote { display: inline-flex; align-items: center; gap: 7px; padding-left: 10px; }
 .gic-exchange-symbol { color: #FFD60A; text-shadow: 0 0 8px rgba(255, 214, 10, 0.45); }
-.gic-exchange-price { color: #E6F1FF; min-width: 9ch; text-align: right; }
-.gic-exchange-move { color: var(--muted); min-width: 10ch; text-align: right; }
+.gic-exchange-price { color: #E6F1FF; width: 11ch; text-align: right; }
+.gic-exchange-move { color: var(--muted); width: 11ch; text-align: right; }
 .gic-exchange-move.gain { color: #00FF88; text-shadow: 0 0 7px rgba(0, 255, 136, .42); }
 .gic-exchange-move.loss { color: #FF2A5F; text-shadow: 0 0 7px rgba(255, 42, 95, .42); }
 .gic-exchange-status { color: var(--subtle); width: 4ch; }
@@ -2226,29 +2346,48 @@ EXCHANGE_TICKER_HTML = """
 
 EXCHANGE_TICKER_JS = """
 export default function({data, parentElement}) {
-    const lanes = parentElement.querySelectorAll('.gic-exchange-lane');
-    for (const lane of lanes) {
-        data.forEach(({name, price, move, direction, status, title}, index) => {
-            let item = lane.children[index];
-            if (!item) {
-                item = document.createElement('span');
-                item.className = 'gic-exchange-quote';
-                item.setAttribute('role', 'listitem');
-                item.innerHTML = `<span class="gic-exchange-symbol"></span><span class="gic-exchange-price"></span>
-                    <span class="gic-exchange-move"></span><span class="gic-exchange-status"></span>
-                    <span class="gic-exchange-divider" aria-hidden="true">│</span>`;
-                lane.append(item);
-            }
-            // Update the cells in place so quote refreshes never restart the marquee.
-            const [label, mark, delta, flag] = item.children;
-            label.textContent = name;
-            mark.textContent = price;
-            delta.textContent = move;
-            delta.className = `gic-exchange-move ${direction}`;
-            flag.textContent = status;
-            item.title = title;
-        });
+    const strip = parentElement.querySelector('.gic-exchange-strip');
+    const lanes = strip.querySelectorAll('.gic-exchange-lane');
+    function update(rows) {
+        for (const lane of lanes) {
+            rows.forEach(({name, price, move, direction, status, title}, index) => {
+                let item = lane.children[index];
+                if (!item) {
+                    item = document.createElement('span');
+                    item.className = 'gic-exchange-quote';
+                    item.setAttribute('role', 'listitem');
+                    item.innerHTML = `<span class="gic-exchange-symbol"></span><span class="gic-exchange-price"></span>
+                        <span class="gic-exchange-move"></span><span class="gic-exchange-status"></span>
+                        <span class="gic-exchange-divider" aria-hidden="true">│</span>`;
+                    lane.append(item);
+                }
+                // Update the quote cells without replacing the animated track.
+                const [label, mark, delta, flag] = item.children;
+                if (label.textContent !== name) label.textContent = name;
+                if (mark.textContent !== price) mark.textContent = price;
+                if (delta.textContent !== move) delta.textContent = move;
+                const tone = `gic-exchange-move ${direction}`;
+                if (delta.className !== tone) delta.className = tone;
+                if (flag.textContent !== status) flag.textContent = status;
+                if (item.title !== title) item.title = title;
+            });
+        }
     }
+    update(data);
+    const refresh = (event) => update(event.detail);
+    strip.addEventListener('gic-exchange-quotes', refresh);
+    return () => strip.removeEventListener('gic-exchange-quotes', refresh);
+}
+"""
+
+MACRO_COMPONENT_JS = """
+export default function({data, parentElement}) {
+    if (parentElement.gicMarkup !== data.markup) {
+        parentElement.innerHTML = data.markup;
+        parentElement.gicMarkup = data.markup;
+    }
+    const strip = document.querySelector('.gic-exchange-strip');
+    strip?.dispatchEvent(new CustomEvent('gic-exchange-quotes', {detail: data.quotes}));
 }
 """
 
@@ -2256,19 +2395,46 @@ export default function({data, parentElement}) {
 HOLDING_COMPONENT_JS = """
 export default function(component) {
     const { data, setTriggerValue, parentElement } = component;
-    if (parentElement.gicMarkup === data && parentElement.querySelector('.gic-table-wrap')) return;
+    let table = parentElement.querySelector('.gic-table-wrap');
+    if (table && parentElement.gicMarkup === data) return;
+    const template = document.createElement('template');
+    template.innerHTML = data;
+    const next = template.content.firstElementChild;
     parentElement.gicMarkup = data;
-    const oldTable = parentElement.querySelector('.gic-table-wrap');
-    const oldFocus = parentElement.querySelector(':focus')?.dataset?.symbol;
-    parentElement.innerHTML = data;
-    const table = parentElement.querySelector('.gic-table-wrap');
-    if (!table) return;
-    if (oldTable && oldTable.dataset.page === table.dataset.page) {
-        table.scrollTop = oldTable.scrollTop;
-        table.scrollLeft = oldTable.scrollLeft;
-        if (oldFocus) {
-            table.querySelector(`button[data-symbol="${CSS.escape(oldFocus)}"]`)?.focus({preventScroll: true});
-        }
+
+    if (!table || table.dataset.page !== next.dataset.page) {
+        parentElement.replaceChildren(next);
+        table = next;
+    } else {
+        const incoming = next.querySelectorAll('tbody tr');
+        const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+        table.querySelectorAll('tbody tr').forEach((row, index) => {
+            const update = incoming[index];
+            if (row.className !== update.className) row.className = update.className;
+            Array.from(row.cells).forEach((cell, column) => {
+                const replacement = update.cells[column];
+                if (cell.className !== replacement.className) cell.className = replacement.className;
+                if (cell.title !== replacement.title) cell.title = replacement.title;
+                if (cell.innerHTML === replacement.innerHTML) return;
+                const button = cell.querySelector('.gic-symbol');
+                if (button) {
+                    const nextButton = replacement.querySelector('.gic-symbol');
+                    button.setAttribute('aria-pressed', nextButton.getAttribute('aria-pressed'));
+                    button.title = nextButton.title;
+                    cell.querySelector('.gic-name').textContent = replacement.querySelector('.gic-name').textContent;
+                } else {
+                    cell.innerHTML = replacement.innerHTML;
+                }
+                const move = replacement.dataset.priceMove;
+                if (!move || reduceMotion) return;
+                cell.getAnimations().forEach((animation) => animation.cancel());
+                const accent = move === 'gain' ? '#00ff88' : '#ff2a5f';
+                cell.animate([
+                    {color: accent, textShadow: `0 0 12px ${accent}`},
+                    {color: getComputedStyle(cell).color, textShadow: 'none'},
+                ], {duration: 1400, easing: 'ease-out'});
+            });
+        });
     }
     table.onclick = (event) => {
         const row = event.target.closest('tr[data-ticker]');
@@ -2290,14 +2456,21 @@ export default function({data, parentElement}) {
 def intraday_chart(market, ticker):
     entry = market["quotes"][ticker]
     bounds = market["bounds"]
+    backfill = market["chart_backfill"]
     figure = go.Figure()
     prices = []
-    for label, tint, frame, start, end in zip(
-        SESSIONS, COLORS, entry["segments"], bounds, bounds[1:]
-    ):
-        figure.add_vrect(x0=pd.Timestamp(start).tz_localize(None),
-                         x1=pd.Timestamp(end).tz_localize(None),
-                         fillcolor=tint, opacity=.055, layer="below", line_width=0)
+    if backfill is None:
+        for tint, start, end in zip(COLORS, bounds, bounds[1:]):
+            figure.add_vrect(x0=pd.Timestamp(start).tz_localize(None),
+                             x1=pd.Timestamp(end).tz_localize(None),
+                             fillcolor=tint, opacity=.055, layer="below", line_width=0)
+        series = zip(SESSIONS, COLORS, entry["segments"])
+        hover_time = "%{x|%H:%M}"
+    else:
+        bars, _ = backfill
+        series = (("15-minute bars", COLORS[1], bars),)
+        hover_time = "%{x|%b %d %H:%M}"
+    for label, tint, frame in series:
         if frame.empty:
             continue
         x = frame.index.tz_localize(None).to_pydatetime().tolist()
@@ -2307,29 +2480,27 @@ def intraday_chart(market, ticker):
             x=x, y=frame["c"].tolist(), name=label, mode="lines" if len(x) > 1 else "markers",
             line={"color": tint, "width": 2}, fill="tozeroy",
             fillcolor=f"rgba({r},{g},{b},0.09)",
-            hovertemplate="%{x|%H:%M} ET · $%{y:,.2f}<extra>%{fullData.name}</extra>",
+            hovertemplate=hover_time + " ET · $%{y:,.2f}<extra>%{fullData.name}</extra>",
         ))
     prior = entry["prior_close"]
-    if prior is not None and prices:
+    if backfill is None and prior is not None and prices:
         prices.append(prior)
         figure.add_hline(y=prior, line_dash="dot", line_color="#7588a7", line_width=1)
     if prices:
         padding = max((max(prices) - min(prices)) * .1, min(prices) * .0015)
         figure.update_yaxes(range=[min(prices) - padding, max(prices) + padding])
-    else:
-        figure.add_annotation(x=.5, y=.5, xref="paper", yref="paper",
-                              text="No trades available yet", showarrow=False)
     figure.update_layout(
         template="plotly_dark", margin={"l": 7, "r": 4, "t": 7, "b": 25},
         paper_bgcolor="#0c101a", plot_bgcolor="#0a1322",
         font={"family": "monospace", "color": "#a6b6cf", "size": 10},
-        showlegend=False, dragmode="zoom", uirevision=f"{ticker}:{market['day']}",
+        showlegend=False, dragmode="zoom", uirevision=f"{ticker}:{market['day']}:{'5d' if backfill else 'intraday'}",
     )
     figure.update_xaxes(
-        range=[pd.Timestamp(bounds[0]).tz_localize(None), pd.Timestamp(bounds[-1]).tz_localize(None)],
-        type="date", tickformat="%H:%M", nticks=7, gridcolor="#1e2a42",
+        type="date", tickformat="%b %d" if backfill else "%H:%M", nticks=7, gridcolor="#1e2a42",
         showspikes=True, spikemode="across", spikecolor="#5b7494", spikethickness=1,
     )
+    if backfill is None:
+        figure.update_xaxes(range=[pd.Timestamp(bounds[0]).tz_localize(None), pd.Timestamp(bounds[-1]).tz_localize(None)])
     figure.update_yaxes(tickprefix="$", side="right", gridcolor="#1e2a42",
                         zeroline=False, nticks=5, automargin=True)
     return figure
@@ -2343,8 +2514,8 @@ def value_class(value):
 
 
 def exchange_ticker_data(live_sim):
-    quotes, fresh = ({}, frozenset()) if live_sim else exchange_ticker_feed().snapshot()
-    rows = []
+    quotes, fresh = ({}, frozenset()) if live_sim else exchange_ticker_feed(tuple(EXCHANGE_TICKERS)).snapshot()
+    rows = {}
     for symbol, (name, demo_price, demo_move) in EXCHANGE_TICKERS.items():
         price, move, day = quotes.get(symbol, (None, None, None))
         status = ""
@@ -2356,17 +2527,24 @@ def exchange_ticker_data(live_sim):
             detail = f"{'Last available' if status else 'Latest'} session · {day}"
         else:
             detail = "Quote unavailable"
-        price_label = metric(price, ",.2f")
-        if symbol == "^TNX" and price is not None:
-            price_label += "%"
-        direction = value_class(move)
-        move_label = {"gain": "▲ ", "loss": "▼ ", "muted": ""}[direction] + percent(move)
-        if direction == "muted" and move is not None:
+        direction = "muted" if not move else "gain" if move > 0 else "loss"
+        price_label = metric(price, ",.2f") if symbol.startswith("^") else price_text(price)
+        if symbol == "^TNX":
+            if price is not None:
+                price_label += "%"
+            move_label = bps_text(move)
+        elif move == 0:
             move_label = "0.00%"
-        rows.append({
+        elif move is None:
+            move_label = "—"
+        elif abs(move) < .005:
+            move_label = "▲ <0.01%" if move > 0 else "▼ <0.01%"
+        else:
+            move_label = ("▲ " if move > 0 else "▼ ") + percent(move)
+        rows[symbol] = {
             "name": name, "price": price_label, "move": move_label, "direction": direction,
             "status": status, "title": f"{name} · {detail}",
-        })
+        }
     return rows
 
 
@@ -2425,6 +2603,10 @@ def stock_browser_controls():
             state.gic_stock_filter_signature = signature
             state.gic_stock_page = 1
         matches, fallback, loading = stock_matches(search, exchange)
+        if search.strip() and matches:
+            ticker = matches[0][0]
+            if ticker == normalize_stock_ticker(search) or (len(matches) == 1 and not loading):
+                ensure_position(ticker)
         pages = max(1, (len(matches) + STOCK_PAGE_SIZE - 1) // STOCK_PAGE_SIZE)
         page = min(pages, max(1, state.get("gic_stock_page", 1)))
         state.gic_stock_page = page
@@ -2452,6 +2634,7 @@ def stock_browser_controls():
 def holding_rows(market, stocks, selected, portfolio, loading_directory=False):
     scores = {entry["ticker"]: entry for entry in market["anomalies"]}
     pnl = {entry["ticker"]: entry["position_pnl"] for entry in portfolio["positions"]}
+    previous_prices = st.session_state.setdefault("gic_previous_session_prices", {})
     rows = []
     for ticker, company in stocks.items():
         entry, alert = market["quotes"][ticker], scores[ticker]
@@ -2470,12 +2653,20 @@ def holding_rows(market, stocks, selected, portfolio, loading_directory=False):
         company_title = escape(company, quote=True)
         gain = pnl.get(ticker)
         close_title = f'Regular close · {entry["regular_close_date"]} ET' if entry["regular_close"] is not None else ""
+        price = entry["price"]
+        displayed = price_text(price)
+        previous_source, previous = previous_prices.get(ticker, (None, None))
+        price_move = ""
+        if previous_source == entry["source"] and price is not None and previous is not None:
+            if displayed != price_text(previous):
+                price_move = "gain" if price > previous else "loss"
+        previous_prices[ticker] = (entry["source"], price)
         rows.append(
             f'<tr class="{" ".join(flags)}" data-ticker="{symbol}">'
             f'<td><button type="button" class="gic-symbol" data-symbol="{symbol}" title="{company_title}" '
             f'aria-pressed="{str(ticker == selected).lower()}">{symbol}</button>'
             f'<span class="gic-name">{name}</span></td>'
-            f'<td title="{source}">{price_text(entry["price"])}</td>'
+            f'<td title="{source}" data-price-move="{price_move}">{displayed}</td>'
             f'<td class="gic-reg-close" title="{close_title}">{price_text(entry["regular_close"])}</td>'
             f'<td class="gic-ext-change {value_class(change)}" title="{tooltip}">{percent(change)}'
             f'<span class="gic-ext-session">{short}</span></td>'
@@ -2495,16 +2686,7 @@ def holding_rows(market, stocks, selected, portfolio, loading_directory=False):
     )
 
 
-def header_pulse(now, market):
-    macro = market["macro"]
-    _, session, _ = market_clock(now)
-    values = macro["indicators"]
-    simulated = '<span class="gic-macro-sim">SIM</span>' if macro["source"] == SIMULATED else ""
-    readings = (
-        f'<span>^TNX <b>{metric(values["^TNX"]["value"], ".2f")}%</b></span>'
-        f'<span>^VIX <b>{metric(values["^VIX"]["value"], ".2f")}</b></span>'
-        f'<span>QQQ <b>{price_text(values["QQQ"]["value"])}</b> {percent(macro["qqq_pct"])}</span>'
-    )
+def header_clocks(now):
     clocks = []
     for flag, zone, label in (("🇺🇸", ET, "ET"), ("🇬🇧", UK, "UK"), ("🇰🇷", KST, "KST")):
         local = now.astimezone(zone)
@@ -2512,10 +2694,22 @@ def header_pulse(now, market):
             f'<span class="gic-clock"><span aria-hidden="true">{flag}</span> '
             f'<time datetime="{local.isoformat()}">{local:%H:%M:%S}</time> {label}</span>'
         )
+    return f'<div class="gic-clocks">{"".join(clocks)}</div>'
+
+
+def header_market_pulse(now, macro, quotes):
+    _, session, _ = market_clock(now)
+    treasury = quotes["^TNX"]
+    qqq = macro["indicators"]["QQQ"]["value"]
+    simulated = '<span class="gic-macro-sim">SIM</span>' if macro["source"] == SIMULATED else ""
     return (
-        f'<div class="gic-pulse"><div class="gic-clocks">{"".join(clocks)}</div>'
+        '<div class="gic-market-pulse">'
         f'<span class="gic-session {"closed" if session == "Closed" else ""}">{SESSION_LABELS[session]}</span>'
-        f'<div class="gic-macro" aria-label="Macro pulse">{readings}{simulated}</div></div>'
+        '<div class="gic-macro" aria-label="Macro pulse">'
+        f'<span title="{escape(treasury["title"], quote=True)}">10Y YIELD <b>{treasury["price"]}</b> '
+        f'<small class="gic-{treasury["direction"]}">{treasury["move"]}</small></span>'
+        f'<span>VIX <b>{quotes["^VIX"]["price"]}</b></span>'
+        f'<span>QQQ <b>{price_text(qqq)}</b> {percent(macro["qqq_pct"])}</span>{simulated}</div></div>'
     )
 
 
@@ -2594,7 +2788,9 @@ def market_view(market, stocks, positions, selected, holding_picker, loading_dir
         on_ticker_change=lambda: None, isolate_styles=False,
     )
     state = st.session_state
-    if result.ticker in stocks and (result.ticker != selected or state.get("gic_relative")):
+    if result.ticker in stocks and (
+        result.ticker != selected or state.get("gic_relative") or result.ticker not in positions
+    ):
         state.gic_chart_pick = result.ticker
         st.rerun(scope="app")
     anomalies = [entry for entry in market["anomalies"] if entry["ticker"] in stocks]
@@ -2618,16 +2814,21 @@ def chart_view(market, selected, symbols):
         relative = st.toggle("vs SMH", key="gic_relative", help="Show AI sector relative strength")
     with title:
         quote_data = market["quotes"]["SMH" if relative else selected]
+        backfill = None if relative else market["chart_backfill"]
         header = "AI sector relative strength" if relative else f"{selected} intraday"
-        return_pct = quote_data["day_change_pct"]
-        chart_source = session_feed_label(quote_data["source"])
+        price, return_pct = quote_data["price"], quote_data["day_change_pct"]
+        source, observation = quote_data["source"], quote_data["time"]
+        if backfill is not None:
+            bars, source = backfill
+            price, return_pct, observation = last_price(bars), None, bars.index[-1]
+        chart_source = session_feed_label(source)
         if relative:
             chart_source = f"SMH · {chart_source}"
         st.html(
             '<div class="gic-chart-head"><div class="gic-panel-top"><div>'
-            f'<h2>{header}</h2><div class="gic-panel-meta" title="{escape(quote_data["source"], quote=True)}">{chart_source}'
-            f' · {display_et(quote_data["time"])}</div></div></div>'
-            f'<div class="gic-chart-price">{price_text(quote_data["price"])} '
+            f'<h2>{header}</h2><div class="gic-panel-meta" title="{escape(source, quote=True)}">{chart_source}'
+            f' · {display_et(observation)}</div></div></div>'
+            f'<div class="gic-chart-price">{price_text(price)} '
             f'<small class="gic-{value_class(return_pct)}">{percent(return_pct)}</small></div></div>'
         )
     figure = relative_strength_chart(market, symbols) if relative else intraday_chart(market, selected)
@@ -2640,6 +2841,8 @@ def chart_view(market, selected, symbols):
     )
     if relative:
         legend = "<span>Return since previous close minus SMH return · Percentage points</span>"
+    elif backfill is not None:
+        legend = f"<span>{CHART_SESSIONS}-day 15-minute bars · Time ET</span>"
     else:
         legend += "<span>Time ET</span>"
     st.html(f'<div class="gic-legend">{legend}</div>')
@@ -2684,13 +2887,15 @@ def edit_position(selected, field_key, remove=False):
         state.position_editor = next(iter(positions))
         message = f"Removed {symbol}."
     else:
-        if selected is None and (not TICKER_PATTERN.fullmatch(symbol) or symbol in positions):
+        previously_held = bool(positions.get(symbol, {}).get("shares"))
+        if selected is None and (not TICKER_PATTERN.fullmatch(symbol) or previously_held):
             state.position_notice = ("error", "Enter a valid ticker that is not already in the portfolio.")
             return
-        if selected is None and len(positions) >= MAX_POSITIONS:
+        shares = state[f"{field_key}_shares"]
+        if shares and not previously_held and sum(bool(pos["shares"]) for pos in positions.values()) >= MAX_POSITIONS:
             state.position_notice = ("error", f"The portfolio supports up to {MAX_POSITIONS} positions.")
             return
-        positions[symbol] = {"shares": state[f"{field_key}_shares"], "cost_basis": state[f"{field_key}_cost"]}
+        positions[symbol] = {"shares": shares, "cost_basis": state[f"{field_key}_cost"]}
         state.position_editor = symbol
         if selected is None:
             state.selected_ticker = symbol
@@ -2833,18 +3038,17 @@ def main():
     state.setdefault("selected_ticker", "NVDA")
     picked = state.pop("gic_chart_pick", None)
     if picked:
+        ensure_position(picked)
         state.selected_ticker = picked
         state.gic_relative = False
-        state.position_editor = picked if picked in state.positions else ADD_POSITION
-        state.gic_new_symbol = "" if picked in state.positions else picked
+        state.position_editor = picked
+        state.gic_new_symbol = ""
 
     key_id, secret_key = setting("APCA_API_KEY_ID"), setting("APCA_API_SECRET_KEY")
     auth = (key_id, secret_key) if key_id and secret_key else None
-    with st.sidebar:
-        positions, feed, active_model_key = sidebar_settings(state.positions, auth, setting("OPENAI_API_KEY"))
-
     holding_picker = st.components.v2.component("gic_holdings_picker", js=HOLDING_COMPONENT_JS)
     chat_scroll = st.components.v2.component("gic_chat_scroll", js=CHAT_SCROLL_JS)
+    market_pulse = st.components.v2.component("gic_market_pulse", js=MACRO_COMPONENT_JS)
     exchange_ticker = st.components.v2.component(
         "gic_exchange_ticker", html=EXCHANGE_TICKER_HTML, css=EXCHANGE_TICKER_CSS, js=EXCHANGE_TICKER_JS,
     )
@@ -2859,25 +3063,31 @@ def main():
         with sim:
             live_sim = st.toggle("Live Sim", key="gic_live_sim", help="Run synthetic ticks even when the exchange is closed.")
 
-        @st.fragment(run_every="1s")
-        def render_pulse():
-            market = visible_snapshot()
-            st.html(header_pulse(datetime.now(ET), market))
-
     holdings, right = st.columns([56, 44])
     with holdings, st.container(key="gic_holdings"):
         stocks, loading_directory = stock_browser_controls()
         stock_list = st.container()
+    with st.sidebar:
+        positions, feed, active_model_key = sidebar_settings(state.positions, auth, setting("OPENAI_API_KEY"))
 
     def visible_snapshot():
-        chart_symbol = "SMH" if state.get("gic_relative") else state.selected_ticker
-        symbols = tuple(sorted({*stocks, chart_symbol}))
-        return market_snapshot(symbols, live_sim, auth, feed)
-
-    with pulse:
-        render_pulse()
+        chart_ticker = None if state.get("gic_relative") else state.selected_ticker
+        symbols = tuple(sorted({*stocks, chart_ticker or "SMH"}))
+        return market_snapshot(symbols, chart_ticker, live_sim, auth, feed)
 
     @st.fragment(run_every="1s")
+    def render_clocks():
+        st.html(header_clocks(datetime.now(ET)), width="content")
+
+    @st.fragment(run_every="5s")
+    def render_market_pulse():
+        quotes = exchange_ticker_data(live_sim)
+        state.gic_exchange_strip_quotes = list(quotes.values())
+        markup = header_market_pulse(datetime.now(ET), state.market_snapshot["macro"], quotes)
+        market_pulse(data={"markup": markup, "quotes": state.gic_exchange_strip_quotes}, key="gic_market_pulse",
+                     isolate_styles=False, width="content")
+
+    @st.fragment(run_every="5s")
     def render_holdings():
         future = state.get("gic_exchange_future")
         if loading_directory and future is not None and future.done():
@@ -2885,12 +3095,12 @@ def main():
         market = visible_snapshot()
         market_view(market, stocks, positions, state.selected_ticker, holding_picker, loading_directory)
 
-    @st.fragment(run_every="1s")
+    @st.fragment(run_every="5s")
     def render_chart():
         market = visible_snapshot()
         chart_view(market, state.selected_ticker, stocks)
 
-    @st.fragment(run_every="1s")
+    @st.fragment(run_every="2s")
     def render_copilot_header():
         status = update_copilot(positions, active_model_key)
         labels = {
@@ -2921,7 +3131,7 @@ def main():
                 if st.button(label, key=f"quick_{label}", width="stretch"):
                     ask_copilot(question)
 
-    @st.fragment(run_every="1s")
+    @st.fragment(run_every="2s")
     def render_chat_feed():
         update_copilot(positions, active_model_key)
         history = state.chat_history
@@ -2949,12 +3159,12 @@ def main():
         if submitted:
             ask_copilot(typed)
 
-    @st.fragment(run_every="2s")
-    def render_exchange_ticker():
-        exchange_ticker(data=exchange_ticker_data(live_sim), key="gic_exchange_ticker", isolate_styles=False)
-
     with stock_list:
         render_holdings()
+    with pulse, st.container(key="gic_header_pulse", horizontal=True, horizontal_alignment="right",
+                             vertical_alignment="center", gap=None):
+        render_clocks()
+        render_market_pulse()
     with right:
         with st.container(key="gic_chart"):
             render_chart()
@@ -2963,7 +3173,7 @@ def main():
             render_quick_actions()
             render_chat_feed()
             render_prompt()
-    render_exchange_ticker()
+    exchange_ticker(data=state.gic_exchange_strip_quotes, key="gic_exchange_ticker", isolate_styles=False)
 
 
 if __name__ == "__main__":
