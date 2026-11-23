@@ -14,6 +14,7 @@ from html import escape, unescape
 from io import StringIO
 from threading import Lock
 from time import monotonic, sleep
+from time import time as wall_time
 from urllib.parse import quote, urlsplit
 from xml.etree import ElementTree
 
@@ -1713,6 +1714,9 @@ html, body, [data-testid="stAppViewContainer"] {
 [data-testid="stStatusWidget"], [data-testid="stSpinner"] { display: none !important; }
 .stApp [data-stale="true"] { opacity: 1 !important; transition: none !important; }
 .stMainBlockContainer { max-width: 1880px; padding: 12px 24px 0; }
+.stMainBlockContainer [data-testid="stLayoutWrapper"]:has(> .st-key-gic_intro) {
+  position: fixed; inset: 0; z-index: 999999; pointer-events: none;
+}
 .stMainBlockContainer [data-testid="stVerticalBlock"],
 .stMainBlockContainer [data-testid="stHorizontalBlock"] { gap: 14px; }
 [data-testid="stHeader"] { background: transparent; height: 46px; }
@@ -1915,6 +1919,52 @@ footer, #MainMenu, [data-testid="stDecoration"], [data-testid="stToolbarActions"
 </style>
 """
 
+
+INTRO_DURATION = 4.5
+INTRO_HTML = """
+<div class="gic-splash" aria-hidden="true">
+  <iframe src="https://framer.app" loading="eager" title="GIC opening animation" tabindex="-1"
+    style="width: 100%; height: calc(100vh + 48px); border: none; display: block;"
+    allow="autoplay; fullscreen"></iframe>
+</div>
+"""
+
+INTRO_CSS = """
+.gic-splash {
+  position: fixed; inset: 0; width: 100vw; height: 100vh; z-index: 999999;
+  background: #030407; overflow: hidden; pointer-events: auto;
+  animation: gicSplashFade 0.65s ease-out 3.6s forwards;
+}
+@keyframes gicSplashFade {
+  0% { opacity: 1; }
+  99.99% { pointer-events: auto; visibility: visible; }
+  100% { opacity: 0; pointer-events: none; visibility: hidden; }
+}
+"""
+
+INTRO_JS = """
+export default function({data, parentElement}) {
+    const splash = parentElement.querySelector('.gic-splash');
+    if (!splash) return;
+    if (splash.gicDismiss) return splash.gicDismiss;
+
+    const fade = splash.getAnimations?.().find(animation => animation.animationName === 'gicSplashFade');
+    // Resume from the elapsed session time if Streamlit creates a new overlay.
+    const elapsed = Math.max(fade?.currentTime ?? 0, data.elapsed * 1000);
+    const dismiss = () => {
+        clearTimeout(deadline);
+        splash.remove();
+    };
+    // Keep the dashboard reachable if the CSS animation is unavailable or canceled.
+    const deadline = setTimeout(dismiss, Math.max(0, data.duration * 1000 - elapsed));
+    splash.gicDismiss = dismiss;
+    if (fade) {
+        fade.currentTime = elapsed;
+        fade.finished.then(dismiss, () => {});
+    }
+    return dismiss;
+}
+"""
 
 EXCHANGE_TICKER_CSS = """
 .gic-exchange-strip {
@@ -2722,8 +2772,16 @@ def ask_copilot(text):
 def main():
     st.set_page_config(page_title="GIC Holdings Tracker", page_icon="◈",
                        layout="wide", initial_sidebar_state="collapsed")
-    st.html(TERMINAL_CSS)
     state = st.session_state
+    intro_start = state.setdefault("intro_start_time", wall_time())
+    st.html(TERMINAL_CSS)
+    # Keep the dashboard at the same Streamlit positions after the intro expires.
+    with st.container(key="gic_intro"):
+        intro_elapsed = max(0.0, wall_time() - intro_start)
+        if intro_elapsed < INTRO_DURATION:
+            intro = st.components.v2.component("gic_intro", html=INTRO_HTML, css=INTRO_CSS, js=INTRO_JS)
+            intro(data={"elapsed": intro_elapsed, "duration": INTRO_DURATION},
+                  key="gic_intro_animation", isolate_styles=False)
     state.setdefault("finance_memory", empty_finance_memory())
     if "finnhub_chat_history" not in state:
         # On a hot upgrade, keep authored strategy notes and general chat. Start market
