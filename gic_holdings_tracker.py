@@ -1920,20 +1920,67 @@ footer, #MainMenu, [data-testid="stDecoration"], [data-testid="stToolbarActions"
 """
 
 
-INTRO_DURATION = 4.5
+INTRO_DURATION = 4.3
 INTRO_HTML = """
 <div class="gic-splash" aria-hidden="true">
-  <iframe src="https://framer.app" loading="eager" title="GIC opening animation" tabindex="-1"
-    style="width: 100%; height: calc(100vh + 48px); border: none; display: block;"
-    allow="autoplay; fullscreen"></iframe>
+  <div class="gic-splash-emblem">GIC</div>
+  <h1 class="gic-splash-title">GIC TERMINAL</h1>
+  <div class="gic-splash-subtitle">by Geonuk Investing Company</div>
+  <div class="gic-splash-track"><div class="gic-splash-fill"></div></div>
+  <div class="gic-splash-count"></div>
 </div>
 """
 
 INTRO_CSS = """
+@property --pct {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 0;
+}
 .gic-splash {
   position: fixed; inset: 0; width: 100vw; height: 100vh; z-index: 999999;
-  background: #030407; overflow: hidden; pointer-events: auto;
-  animation: gicSplashFade 0.65s ease-out 3.6s forwards;
+  background: radial-gradient(circle at 50% 45%, #0D1526 0%, #030407 75%);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  overflow: hidden; pointer-events: auto; text-align: center;
+  font-family: ui-monospace, Consolas, monospace; font-variant-numeric: tabular-nums;
+  animation: gicSplashFade 0.65s ease-out 3.4s forwards;
+}
+.gic-splash-emblem {
+  display: grid; place-items: center; width: 72px; height: 72px; margin-bottom: 24px;
+  border: 1px solid rgba(255, 214, 10, .45); border-radius: 20px;
+  background: rgba(255, 214, 10, .07); color: #FFD60A;
+  font-size: 23px; font-weight: 800; letter-spacing: 2px;
+  text-shadow: 0 0 12px rgba(255, 214, 10, .7); box-shadow: 0 0 26px rgba(255, 214, 10, .19);
+}
+.gic-splash-title {
+  margin: 0; padding: 0; color: #F8FAFC;
+  font: 800 clamp(26px, 5vw, 52px)/1.12 ui-monospace, Consolas, monospace; letter-spacing: 6px;
+}
+.gic-splash-subtitle {
+  color: #94A3B8; font-size: 13px; letter-spacing: 2px; margin-top: 6px;
+}
+.gic-splash-track {
+  width: min(280px, 76vw); height: 4px; margin-top: 30px; border-radius: 999px;
+  background: #202B3C;
+}
+.gic-splash-fill {
+  width: 0%; height: 100%; border-radius: inherit; background: #FFD60A;
+  box-shadow: 0 0 10px rgba(255, 214, 10, .72);
+  animation: gicSplashProgress 3.2s linear both;
+}
+.gic-splash-count {
+  margin-top: 12px; color: #FFD60A; font-size: 12px;
+  counter-reset: pct var(--pct);
+  animation: gicSplashCount 3.2s linear both;
+}
+.gic-splash-count::after { content: "Opening session " counter(pct) "%"; }
+@keyframes gicSplashProgress {
+  from { width: 0%; }
+  to { width: 100%; }
+}
+@keyframes gicSplashCount {
+  from { --pct: 0; }
+  to { --pct: 100; }
 }
 @keyframes gicSplashFade {
   0% { opacity: 1; }
@@ -1948,7 +1995,8 @@ export default function({data, parentElement}) {
     if (!splash) return;
     if (splash.gicDismiss) return splash.gicDismiss;
 
-    const fade = splash.getAnimations?.().find(animation => animation.animationName === 'gicSplashFade');
+    const animations = splash.getAnimations?.({subtree: true}) ?? [];
+    const fade = animations.find(animation => animation.animationName === 'gicSplashFade');
     // Resume from the elapsed session time if Streamlit creates a new overlay.
     const elapsed = Math.max(fade?.currentTime ?? 0, data.elapsed * 1000);
     const dismiss = () => {
@@ -1958,10 +2006,10 @@ export default function({data, parentElement}) {
     // Keep the dashboard reachable if the CSS animation is unavailable or canceled.
     const deadline = setTimeout(dismiss, Math.max(0, data.duration * 1000 - elapsed));
     splash.gicDismiss = dismiss;
-    if (fade) {
-        fade.currentTime = elapsed;
-        fade.finished.then(dismiss, () => {});
+    for (const animation of animations) {
+        animation.currentTime = Math.max(animation.currentTime ?? 0, elapsed);
     }
+    fade?.finished.then(dismiss, () => {});
     return dismiss;
 }
 """
